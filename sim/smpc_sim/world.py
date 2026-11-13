@@ -46,6 +46,9 @@ class EpisodeConfig:
     switch_delay_sec: float = 0.0
     acc_floor_real: bool = False      # ACC 하한(merge_keep_rolling)을 실제 C++ 규칙대로(acc.py floor_real)
     acc_tf_on_start: bool = False     # ACC 가 차선 변경 실행 시작부터 목표 차선 앞차를 정상 추종(acc.py tf_on_start)
+    record_risk: bool = False         # 0.5 s 구간별 최소 TTC·간격을 남긴다(risk_buckets, RC 라벨용)
+    explore_eps: float = 0.0          # 수집용 탐색: 판단 틱마다 이 확률로 실행 가능한 후보 중 하나를 무작위로 고른다
+    explore_wait_eps: float = 0.0     # 수집용 탐색: 바꿀 수 있는 판단에서 이 확률로 0.5–3 s 일부러 기다린다
 
 
 @dataclass
@@ -69,6 +72,7 @@ class EpisodeResult:
     stop_events: list = field(default_factory=list)   # 차선 끝 정지 시각
     min_sep: float = math.inf        # 2-D 박스 분리 최소값 max(종 간격, 횡 간격) (음수 = 겹침)
     near_lat_ticks: int = 0          # 나란히(종 겹침) 횡 간격 < 0.5 m 인 틱 수
+    risk_buckets: list = field(default_factory=list)  # record_risk: [(구간 시작 t, 최소 TTC, 최소 간격)] 0.5 s 구간
     nudges: int = 0                  # 머리 넣기 시작 횟수
     nudge_aborts: int = 0            # 머리 넣었다가 뺀 횟수(차선 변경으로 이어지지 않음)
 
@@ -281,6 +285,9 @@ class World:
         self.acc.f = v0
         self.lc_connector = False
         self.t0 = self.t
+        self.planner.explore_eps = cfg.explore_eps
+        self.planner.explore_wait_eps = cfg.explore_wait_eps
+        self.planner.explore_rng = np.random.default_rng(cfg.seed + 99991)
 
     def run(self):
         cfg = self.cfg
@@ -379,6 +386,7 @@ class World:
             self.t += cfg.dt
 
             # 지표
+            tick_ttc, tick_gap = math.inf, math.inf
             for n in self.npcs:
                 if obb_overlap(e, n, self.track):
                     res.collision = True
@@ -396,8 +404,16 @@ class World:
                         c = n.v - e.v
                     if abs(n.y - e.y) < 0.5 * (e.width + n.width) + 0.3:
                         res.min_gap = min(res.min_gap, g)
+                        tick_gap = min(tick_gap, g)
                         if c > 0.1 and g > 0:
                             res.min_ttc = min(res.min_ttc, g / c)
+                            tick_ttc = min(tick_ttc, g / c)
+            if cfg.record_risk:
+                kb = int((now - self.t0) / 0.5 + 1e-9)
+                while len(res.risk_buckets) <= kb:
+                    res.risk_buckets.append([round(len(res.risk_buckets) * 0.5, 2), math.inf, math.inf])
+                bk = res.risk_buckets[kb]
+                bk[1], bk[2] = min(bk[1], tick_ttc), min(bk[2], tick_gap)
             lane_now = self.sup.lane if not self.sup.active else self.sup.source
             if e.v < 0.5 and lane_now < self.track.final_lane:
                 res.stop_time += cfg.dt

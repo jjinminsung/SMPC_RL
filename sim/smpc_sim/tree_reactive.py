@@ -303,11 +303,17 @@ def make_reactive_planner(name):
     민감도: 'sgNN' = 차량 위치 σ 시간 인자 상한 NN/10 s, 'slNN' = 횡 σ 상한, 'prNN' / 'pbNN' = 뒤차 비양보 / 앞차 급감속
       확률 NN/100, 'single' = 가지 없는 비교군, 'common' = G6–G8 유지.
     RL 종단 비용: '<플래너>@<TR 가중치>' = 학습한 꼬리 위험(rl/tail_risk.py)을 판단·모니터의 지평선 끝에 더한다.
-    예: rx_mt_pf_fl_tfs_rr_ng6_nv20_nm_h10_rf10@models/TR.pt"""
+    예: rx_mt_pf_fl_tfs_rr_ng6_nv20_nm_h10_rf10@models/TR.pt
+    RL 모니터: '<플래너>_RCNN@<RC 가중치>' = RC(rl/risk_critic.py) > NN/100 이면 '지금 바꾸기'를 막는다.
+      'rcf' = RC 가 막은 틱에는 차선 끝 전에 설 수 있는 준비 후보만 남긴다.
+    예: rx_mt_pf_fl_tfs_rr_ng6_nv20_nm_h10_rf10_rcf_RC50@models/RC.pt"""
     from .tree import TreeConfig
-    tr_path = None
+    tr_path, rc_path, rc_th = None, None, None
     if "@" in name:
         name, tr_path = name.split("@", 1)
+        rc_th = next((int(f[2:]) / 100.0 for f in name.split("_") if f.startswith("RC") and f[2:].isdigit()), None)
+        if rc_th is not None:
+            rc_path, tr_path = tr_path, None
     flags = set(name.split("_"))
     cfg = TreeConfig(probability_table="gt", keep_gates=False, decision="tree", monitor=True)
     floor = next((int(f[1:]) / 100.0 for f in flags if f.startswith("f") and f[1:].isdigit()), None)
@@ -357,6 +363,10 @@ def make_reactive_planner(name):
         if tr_path:
             from .rl.tail_risk import load_tail_fn
             tp.tail_fn = load_tail_fn(tr_path)
+        if rc_path:
+            from .rl.risk_critic import load_rc_fn
+            tp.rc_fn, tp.rc_th = load_rc_fn(rc_path), rc_th
+            tp.rc_fallback = "rcf" in flags
         tp.nudge_depth = probe if probe is not None else nudge
         tp.nudge_go = probe is not None
         tp.nudge_max_speed = nudge_vmax
