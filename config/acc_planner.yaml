@@ -1,0 +1,266 @@
+ego_length_m: 4.635
+ego_width_m: 1.892
+ego_front_extent_m: 3.845
+ego_rear_extent_m: 0.790
+# 정지 시 앞차 간격.  critical_gap_m / emergency_gap_m 와 한 묶음 (바꿀 때 셋 다 함께).
+# 모의: 앞차 급정거 최소간격 5.2 m (트래커 지연 0.9 s), 정체 가다서다 급제동 0 s.
+standstill_gap_m: 5.0
+# 차간 시간.  유지간격 11 m/s 18 m, 25 m/s 35 m (정지간격 5 m 포함).
+# 안정 추종 중 앞차 4~9 m/s^2 급정거 모의에서 최소간격 13.0~15.6 m.
+# lead_required_decel_limit_headway_sec 보다 작게 내리면 추종 중 감속 제한이 풀리므로
+# 함께 낮출 것.  뒤차 회피 가속의 목표차선 앞차 간격 조건
+# (max(min_target_front_gap, 차간*속도))도 이 값을 쓴다.
+time_headway_sec: 1.2
+gap_gain: 1.05
+closing_speed_gap_time_sec: 1.6
+# Used by the follow-speed/braking-distance guards. A smaller assumed value
+# makes normal ACC begin reducing target speed earlier.
+braking_decel_mps2: 3.8
+soft_ttc_sec: 7.0
+hard_ttc_sec: 2.8
+min_speed_mps: 0.0
+max_accel_mps2: 4.0
+max_decel_mps2: 7.0
+
+# Keep normal ACC following behavior, but let the filtered speed target drop
+# faster when ego is rapidly closing on a much slower/stopped front vehicle.
+closing_decel_boost_enabled: true
+closing_decel_boost_start_mps: 1.0
+closing_decel_boost_full_mps: 6.0
+closing_decel_boost_max_decel_mps2: 11.0
+
+hard_brake_decel_mps2: 12.0
+hard_brake_bypass_filter: true
+# TTC 속도 제한의 여유 거리.  정지간격(standstill_gap_m)과 맞춤.
+emergency_gap_m: 5.0
+
+# ACC following behavior: emergency_gap is a strong-following zone, not an
+# automatic stop.  A full hard stop is reserved for truly critical distance/TTC.
+# These are the hard-brake gates: once crossed ACC publishes 0 m/s without
+# its speed filter so MPC emits a full brake command immediately.
+# 정지간격(5 m)보다 작아야 정체 추종 중 급제동이 반복되지 않는다.
+critical_gap_m: 3.0
+critical_ttc_sec: 2.2
+max_follow_speed_drop_mps: 8.0
+
+# 앞차 추종 감속을 실제로 필요한 만큼만.
+# 일반 앞차 추종(hard/rapid 아님)에서 목표속도가 떨어지는 속도를
+#   필요 감속 = 접근속도^2 / (2 * (간격 - standstill_gap - headway * 자차속도))
+# 의 gain 배(최소 min)로 제한한다.  원하는 간격/목표속도는 그대로이고 도달 속도만
+# 바뀐다.  hard/rapid 는 필터를 건너뛰므로 영향 없음.  차선 끝/SMPC/connector
+# 상한이 목표를 정할 때는 각자의 한도 그대로.
+# 근거: MORAI 실측에서 멀리 있는 앞차(20 m 이상)에도 강제동(brake>=0.5)이 잦았다
+#   (예: 필요 감속 0.07 m/s^2 에 brake 0.63, 실측 brake 0.6 ~= 6.8 m/s^2).
+# 폐루프 모의(끈 경우 대비): 최대 brake 중앙 0.53 -> 0.11, 새 hard 0건.
+#   앞차 4/8 m/s^2 급정거 스트레스에서 추돌 0.
+lead_required_decel_limit_enabled: true
+lead_required_decel_limit_gain: 1.5
+lead_required_decel_limit_min_mps2: 1.5
+# time_headway_sec 보다 크면 추종 중 감속 제한이 풀린다.
+lead_required_decel_limit_headway_sec: 1.2
+
+# Rapid response for a lead that is first seen in front of ego (cut-in,
+# occlusion release, or delayed LiDAR detection). If TTC is below 3 s or the
+# required deceleration to retain the standstill gap exceeds 5 m/s^2, bypass
+# ACC target-speed slew limiting and immediately command the safe speed.
+rapid_lead_brake_enabled: true
+rapid_lead_ttc_sec: 3.0
+rapid_lead_min_closing_speed_mps: 4.0
+rapid_lead_required_decel_mps2: 5.0
+
+target_timeout_sec: 0.8
+decision_request_timeout_sec: 0.5
+publish_rate_hz: 20.0
+
+# MPC publishes the CSV mission_state speed target here; SMPC only consumes it.
+mission_speed_topic: "/control_feedback/mission_speed_target_mps"
+mission_speed_timeout_sec: 0.5
+mission_speed_fallback_mps: 15.0
+
+# High-level SMPC preparation request.  ACC remains the sole publisher of
+# /smpc/target_speed_mps: this request is only an extra speed cap after all
+# lead/TTC/lane-end safety limits have been applied.
+behavior_request_enabled: true
+behavior_request_topic: "/smpc/behavior_longitudinal_request"
+behavior_request_timeout_sec: 0.35
+behavior_status_topic: "/smpc/behavior_longitudinal_status"
+behavior_request_apply_while_lane_change: false
+# Apply only SMPC's bounded, target-rear-aware acceleration preparation.
+# Normal front/TTC/lane-end arbitration remains the stricter upper bound.
+behavior_request_apply_accel: true
+
+# When waypoint_system uses its endpoint connector to hand off an exhausted
+# source CSV to the target lane, limit the ACC target to a moderate crawl
+# speed.  The Bool has no header, so true must be refreshed within
+# endpoint_connector_status_timeout_sec; stale or missing state never applies
+# this cap.
+# 7.0: connector(target_forward 20 m) 최대 곡률 0.049 1/m(반경 20.6 m) 에서
+# 횡가속 = v^2 * k = 2.4 m/s^2.  정지 출발 차선변경 소요 약 2 초.
+# 목표 차선별 connector 속도 상한.  인덱스 = 합류하는 차선 번호.
+# 0->1 (차선1로 합류): 9.0.  connector 구간 자차가 느리면 18 m/s 로 접근하는
+#   뒤차 앞에 들어가 추돌한다 (보정 모의에서 9 m/s 로 추돌 0건).
+# 1->2, 2->3: 7.0.  9 로 올리면 1->2 정지 출발에서 connector preview 가 지평
+#   coverage 를 못 채워 거부된다.  차선2 는 합류 후 14~22 m 뿐이라 빨리 들어가면
+#   급정거만 커지고, 2->3 은 합류 구간 정체로 들어간다.
+# ACC endpoint_connector_speed_cap_by_target_lane_mps 와
+# SMPC stopped_launch_connector_speed_cap_by_target_lane_mps 는 반드시 같게.
+# 아래 단일 값은 목록 밖/0 이하일 때의 기본값.
+endpoint_connector_speed_cap_mps: 7.0
+endpoint_connector_speed_cap_by_target_lane_mps: [7.0, 9.0, 7.0, 7.0]
+# Only while the endpoint connector is actively tracked, restore the target
+# speed at 4.0 m/s^2. Normal ACC recovery uses the same limit above.
+endpoint_connector_max_accel_mps2: 4.0
+endpoint_connector_status_timeout_sec: 0.5
+# 차선 끝 근처에서 주행 중 시작한 차선변경의 속도 상한.
+# waypoint blend 는 source/target 점을 인덱스로 짝짓고 source 끝 뒤로는 target 점을
+# 그대로 붙인다.  blend(4 s) 가 끝나기 전에 source 끝에 닿으면 경로에
+# (1-alpha)*차선간격 계단이 생긴다 (5.3 m/s, 29 m 전 시작 + 가속 시 alpha~0.8,
+# 약 0.7 m).  상한 = (차선끝까지 - margin) / 남은 차선변경 시간(최소 0.5 s),
+# 하한 min_cap (차선 중간 정지 방지).  차선 끝에서 멀면 상한이 순항보다 커서 무영향.
+# connector 는 자체 상한.  SMPC change_commit_allow_lane_end_wait_decel 과 한 묶음.
+lane_change_lane_end_cap_enabled: true
+lane_change_lane_end_margin_m: 3.0
+lane_change_lane_end_min_cap_mps: 3.0
+# 목표 차선 중심까지 이 거리 안으로 들어오면 위 상한을 해제.
+# 상한은 blend 중 원래 차선 끝에 일찍 닿는 것을 막기 위한 것인데, 차체가 이미 목표
+# 차선에 들어온 뒤에는 막을 대상이 없다.  해제하지 않으면 목표차선 중심까지
+# 0.5~0.9 m 인데도 남은 원래 차선 길이 때문에 상한이 하한 3.0 m/s 로 떨어져
+# 주행 중 불필요한 제동이 걸린다 (MORAI 실측).
+# 0 이면 해제하지 않음.
+lane_change_lane_end_cap_release_abs_d_m: 1.5
+# 차선 끝 대기/정지/비상정지는 감독자가 차선변경을 실제로 시작(lane_change_status
+# active)했을 때만 푼다.  CHANGE_LEFT 요청만으로 풀면 ACC 사유가 none 으로 바뀌고,
+# 자차는 아직 대기 감속 중이라 SMPC 가 "ACC 불안정"으로 요청을 거둔다 -> 대기 복귀
+# -> 재요청 반복.  감독자는 3 연속 요청이 필요해 끝내 시작하지 못하고 정지 후에야 합류.
+# 요청~시작 사이(요청 3회, 약 0.15~0.3 s)는 대기 감속이 계속된다.
+# false 면 요청만으로 푼다.
+lane_end_hold_until_lane_change_active: true
+# 같은 이유로, 요청이 오면 ACC 가 SMPC 의 WAIT_FOR_GAP(틈 기다림) 요청을 지워
+# lane_end_wait_no_safe_gap 대기도 풀리던 경로를 막는다.  요청 직전의 WAIT_FOR_GAP
+# (같은 차선 쌍)을 차선변경 시작 전까지, 최대 이 시간 동안 유지.  위 값이 false 면 무시.
+# 이 유지는 요청 철회 반복을 없애는 대신, 반복이 걸러주던 인식 누락 순간의 승인을
+# 통과시킨다.  그래서 selector tracked_vehicle_confidence_hold_* 와 SMPC
+# vanished_target_hold_* 를 전제로 한다.  두 대책을 끄면 이 값도 0.0 으로 둘 것.
+lane_end_hold_wait_for_gap_latch_sec: 1.0
+
+# Target-lane gap and lane-end fallback braking.
+min_target_front_gap_m: 11.0
+min_target_rear_gap_m: 6.0
+
+# Do not let target-lane front vehicles trigger ACC braking before ego has
+# actually entered the target lane.  This prevents target_front:hard from
+# killing merge momentum during the initial lane-change phase.
+target_front_acc_requires_target_lane_entry: true
+target_front_acc_entry_abs_d_m: 0.75
+# Legacy lane-end-only pre-entry soft ACC (off).  The active lane-change
+# soft-ACC below is instead tied to ego's physical lane overlap.
+target_front_preentry_soft_acc_enabled: false
+target_front_preentry_soft_acc_distance_to_end_m: 200.0
+
+# During an active lane change, start gently following target_front when ego's
+# body first reaches the target lane.  With a 3.5 m lane and 1.9 m ego width,
+# 2.7 m is the target-center offset at which the ego footprint crosses the
+# lane boundary.  Full target-front hard/rapid braking stays disabled until
+# abs(ego_d_target) <= target_front_acc_entry_abs_d_m above.
+target_front_overlap_soft_acc_enabled: true
+target_front_overlap_soft_acc_start_abs_d_m: 2.7
+target_front_overlap_soft_max_decel_mps2: 1.5
+
+# A rapidly closing target-lane rear vehicle is not a reason to brake into its
+# path.  During the pre-centre portion of an active lane change, suppress only
+# non-emergency target_front soft following; full front hard/rapid braking is
+# never suppressed.  The supervisor independently aborts before the target
+# lane centre when the rear cannot be safely escaped.
+active_rear_guard_enabled: true
+active_rear_guard_min_gap_m: 9.0
+active_rear_guard_min_ttc_sec: 3.0
+# Closing-speed only; this mirrors SMPC/supervisor and does not suppress
+# target-front soft ACC merely because ego is faster than a receding rear.
+active_rear_guard_min_headway_sec: 1.2
+active_rear_guard_abort_before_target_center_abs_d_m: 1.75
+active_rear_guard_perception_control_delay_sec: 0.50
+active_rear_guard_stationary_remaining_sec: 8.0
+# When the supervisor says a rear threat is escapable and target-front space
+# remains safe, allow a modestly faster speed recovery during the active merge.
+active_rear_escape_max_accel_mps2: 4.0
+
+# Keep ACC aligned with the SMPC rear-safety policy: do not relax a target-lane
+# rear gap while ego is preparing or executing a highway merge.
+merge_priority_enabled: false
+merge_priority_rear_safe_gap_m: 4.5
+merge_priority_rear_min_gap_m: 4.0
+merge_priority_rear_max_closing_mps: 3.5
+merge_priority_rear_min_ttc_sec: 1.8
+
+# In multi-lane merge zones, do not let side-lane vehicles that are entering
+# ego's current lane become ACC leads too early. If they are already close in
+# front, the normal ACC emergency/lead logic still applies.
+ego_lane_priority_enabled: true
+ego_lane_priority_current_max_abs_d_m: 1.25
+ego_lane_priority_front_hard_gap_m: 8.0
+
+lane_end_stop_margin_m: 2.0
+lane_end_comfort_decel_mps2: 2.5
+lane_end_merge_creep_speed_mps: 4.0
+lane_end_hard_stop_distance_m: 6.0
+# For lanes 0,1,2, if SMPC cannot approve the next-left merge, use this
+# pre-end buffer as a holding line.  Stopping here keeps /local_path long
+# enough for MPC polyfit while gap/risk evaluation continues.
+lane_end_merge_wait_stop_enabled: true
+# endpoint connector(20 m) 와 짝.  lane1 끝점은 lane2 의 잔여 14.0 m 지점이라
+# (차선 CSV 실측), 정지선이 25 m 여야 1->2 합류 후 lane2 잔여 18.9 m 가 남아
+# 다음 2->3 connector(10 m 전방 필요)를 만들 수 있다.
+# 합류 후 잔여: 0->1 302.7 m / 1->2 18.9 m / 2->3 658.8 m.
+lane_end_merge_wait_stop_distance_m: 25.0
+stop_at_lane_end_enabled: true
+# Lanes 0,1,2 use the SMPC lane-end deadline to change left if the target gap is safe.
+# Lane 3 is the final highway lane and stops at its CSV endpoint.
+lane_end_stop_lane_ids: [3]
+lane_end_stop_prepare_distance_m: 45.0
+lane_end_stop_prepare_time_sec: 4.0
+
+# Enable exactly one nearby safety use: a vehicle whose bbox overlaps ego both
+# longitudinally and laterally in the current/target lane Frenet corridor.
+# Other nearby_front/rear candidates remain excluded from ACC and from SMPC
+# behavior risk (risk_include_nearby_vehicles=false).
+use_nearby_vehicles: true
+use_nearby_overlap_as_acc_lead: true
+nearby_acc_overlap_only: true
+nearby_overlap_lateral_margin_m: 0.20
+# ACC 리드는 차체 중심이 자차보다 앞에 있어야 한다.  앞끝만 자차를 넘은 차량
+# (자차와 나란하거나 뒤에 붙은 차)이 리드가 되면 critical_gap 조기 반환으로
+# 목표속도 0 이 나가, 뒤차 때문에 급제동하게 된다.  current_front /
+# target_front / nearby_overlap 세 경로에 공통 적용된다.
+lead_requires_center_ahead: true
+# 미성숙 트랙(hits < 5)에는 완전 정지를 명령하지 않고 이 속도까지만 내린다.
+# 유령은 예측 연명으로 hits 가 낮고 실차는 빠르게 쌓인다.  감속은 그대로
+# 허용하므로 장애물을 버리는 것이 아니다.
+# 근거(MORAI 실측, 하드브레이크를 실제로 유발한 트랙): hits<5 14건 중 12건이 유령,
+# hits>=5 19건은 전부 실차.  실차 트랙은 생성 후 약 0.33 s 에 hits>=5 에 도달하므로
+# 정당한 하드 브레이크는 그만큼만 늦고, 그동안에도 일반 ACC 감속은 계속된다.
+immature_lead_min_hits: 5
+immature_lead_min_speed_mps: 2.0
+# This threshold applies only when nearby_acc_overlap_only is false.
+nearby_acc_lead_max_abs_d_m: 1.35
+nearby_merge_front_range_m: 120.0
+nearby_merge_rear_range_m: 20.0
+use_all_nearby_when_lane_end_pressure: false
+
+# A target rear vehicle is not an ACC deceleration lead.  It remains in
+# SMPC's merge-safety decision, while ACC lane-end waiting reacts only to a
+# target-front blocker.
+lane_end_wait_gap_front_only: true
+
+# During lane-change waiting/active merge, avoid losing all momentum just to
+# yield. Keep rolling unless there is a close front blocker or a critical
+# collision condition. This makes it easier to enter the next usable gap.
+merge_keep_rolling_enabled: true
+# Highway merge target: an approved lane change keeps enough longitudinal
+# momentum to complete the manoeuvre at about 40 km/h (11.1 m/s).
+merge_keep_rolling_min_speed_mps: 11.1
+merge_keep_rolling_front_block_gap_m: 8.0
+# Merge momentum never overrides ACC for a front vehicle travelling below the
+# merge-speed floor. If a valid lead is within this range, ACC may command a
+# lower speed (including 0 m/s) and use its normal desired standstill gap.
+merge_keep_rolling_low_speed_lead_mps: 11.1
+merge_keep_rolling_low_speed_lead_max_gap_m: 80.0

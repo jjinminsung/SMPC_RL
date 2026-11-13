@@ -1,0 +1,573 @@
+"""반응형 예측. 자차와 타겟 차량을 0.2 s 단위로 함께 굴린다.
+
+자차 = ACC 폐루프. 매 스텝 ACC 법칙(acc.py 의 앞차 추종 식, 차선 끝 정지, 차선 변경 중 차선 끝 상한,
+  준비 행동 속도 상한)으로 목표 속도를 내고, 변화율 필터(+4.0 / −7.0 m/s²)를 거쳐
+  1 차 응답(plant.py 와 같은 식)으로 실제 속도를 만든다. 기존 예측의 '합류 뒤 속도 = min(미션, 앞차)'
+  고정값과 '연결 경로 상한까지 앞차를 무시하고 가속'을 대신한다.
+타겟 차량 = 반응 모델. 가지(branch) = (뒤차 mode, 앞차 mode).
+  뒤차  yield    : 자차 차체가 목표 차선에 rear_react_intrusion_m 이상 들어오고 rear_react_delay_s 가 지나면
+                   자차를 앞차로 보고 IDM 으로 따라간다(감속 한계 rear_max_brake). 그 전에는 자기 앞차/등속.
+        nonyield : 자차를 무시한다(자기 앞차/등속).
+  앞차  base     : 자기 앞차가 보이면 IDM, 아니면 현재 가속도가 accel_decay_s 로 사라지는 등가속.
+        brake    : front_brake m/s² 로 정지까지.     accel : front_accel m/s² (현재 속도 + 5 m/s 까지, 자기 앞차가
+                   있으면 그 차를 IDM 으로 따르는 가속을 넘지 않는다).
+예측용 반응 파라미터는 시뮬 NPC(npc.py) 값과 일부러 다르게 둔다(예측 모델을 자기 자신으로 시험하지 않기).
+
+대응: 0 = 계속, 1 = 복귀(가지가 드러나는 시점 t_b 부터 측정 복귀 곡선으로 원 차선, 이후 ACC 는 원 차선 기준).
+행 순서: (가지 b, 대응 r, 루트 n) 을 한 배열로 쌓아 한 번에 굴린다.
+"""
+from dataclasses import dataclass
+import math
+
+import numpy as np
+
+from .params import load_params
+from .risk import collision_probability
+from .rollouts import (ACCEL, HOLD, NUDGE, NUDGE_CREEP_BELOW, NUDGE_CREEP_MPS, NUDGE_LAT_T, NUDGE_LEN_M, NUDGE_STOP_M,
+                       YIELD, execution_start, nudge_len)
+
+CONTINUE, RETURN = 0, 1
+BRAKING_DECEL = 3.8                      # acc.py speed_for_lead
+
+
+@dataclass
+class ReactiveParams:
+    # 자차 응답 (plant.py EgoPlant 와 같은 값. MORAI 측정: τ 0.4, 가속 ≤ 2.5)
+    plant_tau: float = 0.7
+    plant_a_max: float = 3.0
+    plant_a_min: float = -6.0
+    plant_a_stop: float = -9.0
+    plant_jerk: float = 12.0
+    acc_up: float = 4.0
+    acc_dn: float = 7.0
+    mission_ramp: float = 0.0            # 시뮬은 미션 속도 일정. MORAI 는 차선 전환 뒤 약 2.5 m/s² 로 회복
+    cruise_max: float = 0.0              # 회복 상한(0 이면 지금 미션 속도). MORAI: 차선 끝 서행 3.15 m/s → 순항
+    lane_end_decel: float = 2.5          # acc.py 차선 끝 정지 한계 감속
+    connector_cap: bool = True           # 정지 connector 중 ACC 속도 상한(시뮬 world 도 같은 상한을 건다)
+    # 뒤차 반응 (임시값)
+    rear_react_intrusion_m: float = 0.3
+    rear_react_delay_s: float = 1.0
+    rear_detect_s: float = 0.5           # 반응 지연이 지난 뒤 '감속 없음'을 알아채는 데 걸리는 시간
+    rear_idm_s0: float = 3.0
+    rear_idm_T: float = 1.0
+    rear_idm_a: float = 1.0
+    rear_idm_b: float = 2.0
+    rear_max_brake: float = 3.0
+    # 앞차
+    front_brake: float = -2.5
+    front_accel: float = 1.0
+    front_detect_s: float = 0.3
+    accel_decay_s: float = 1.5
+    front_idm_s0: float = 3.0
+    front_idm_T: float = 1.0
+    front_idm_a: float = 1.0
+    front_idm_b: float = 2.0
+    # 예외 확률 최솟값
+    p_exc_floor: float = 0.05
+    # 진단용(보수성 원인 측정). None = 쓰지 않음
+    p_rear_floor: float = None           # 뒤차 비양보 확률(없으면 p_exc_floor)
+    p_brake_floor: float = None          # 앞차 급감속 확률(없으면 p_exc_floor)
+    sigma_cap_s: float = None            # 모든 차량 위치 σ 의 시간 인자 상한 [s]
+    debug_per_tv: bool = False           # 차량별 충돌 확률도 돌려준다(risk_tv)
+    tf_on_start: bool = False            # 차선 변경 실행 시작부터 목표 차선 앞차 정상 추종(acc.py tf_on_start 와 같다)
+    # probe(머리 넣고 기다렸다가 이어 가기)의 '이어 가기' 조건: 뒤차 반응이 드러난 뒤, 목표 차선 차량과의 간격이 열렸을 때
+    go_gap_min_m: float = 3.0            # 앞·뒤 최소 간격 [m]
+    go_rear_headway_s: float = 0.8       # 뒤차 간격 ≥ 뒤차 속도 × 이 값
+    go_front_headway_s: float = 0.5      # 앞차 간격 ≥ 자차 속도 × 이 값
+    go_closing_max_mps: float = 1.0      # 뒤차가 자차보다 이만큼 넘게 빠르면 이어 가지 않는다
+    lat_sigma_cap_s: float = None        # 횡 σ 의 시간 인자 상한 [s] (None = 상한 없음: 0.25 + 0.10·t 로 계속 커짐)
+    nudge_exec_delay: bool = False       # True = 머리 넣기도 차선 변경 실행 지연 뒤 시작
+    rear_revealed: bool = False          # 뒤차 양보 여부를 이미 관측함(머리 넣은 채 모니터): 반응 지연·알아챔 없이 지금 드러남
+    # 자차가 ACC 로 따라가는 앞차는 위치 불확실성 σ 의 시간 인자를 이 값에서 멈춘다: 앞차가 예측과 다르게
+    # 움직여도 자차가 반응(피드백)하므로 열린 루프처럼 σ 가 끝없이 커지지 않는다(Nair 외 TCST 2025 의 상태 피드백과 같은 취지).
+    follow_sigma_cap_s: float = 1.0
+    abort_before_abs_d: float = 1.75     # 목표 차선 경계(이 안쪽이면 복귀 불가, supervisor 와 같다)
+    # 자차가 지나친 목표 차선 앞차(tf·tf2) = 뒤차(C++ reactive/passed_front_as_rear): 뒤차 가지 공유, yield 면 반응
+    # 지연 뒤 자차를 따름, 지나친 뒤 앞차 예외 없음, σ 상한 없음
+    passed_front_as_rear: bool = False
+    # 실제 ACC 의 merge_keep_rolling 하한과 차선 끝 대기 조건(C++ reactive/merge_floor)
+    merge_floor: bool = False
+    floor_urgent_distance_m: float = 120.0   # target_selector lane_end_urgent_distance_m
+    floor_urgent_time_s: float = 5.0         # target_selector lane_end_urgent_time_sec
+
+
+def _idm(v, gap, v_lead, v0, a, b, s0, T):
+    gap = np.maximum(gap, 0.1)
+    s_star = s0 + np.maximum(0.0, v * T + v * (v - v_lead) / (2.0 * math.sqrt(a * b)))
+    return a * (1.0 - (v / np.maximum(v0, 0.5)) ** 4 - (s_star / gap) ** 2)
+
+
+def speed_for_lead(gap, v_lead, v_e, cruise, A):
+    """acc.py AccPlanner.speed_for_lead 의 벡터판(앞차 추종 목표 속도). hard 여부도 낸다."""
+    vL = np.minimum(np.maximum(v_lead, 0.0), cruise)
+    c = np.maximum(0.0, v_e - vL)
+    g_star = A.standstill_gap_m + A.time_headway_sec * v_e + A.closing_speed_gap_time_sec * c + c * c / (2 * BRAKING_DECEL)
+    cmd = np.maximum(vL + A.gap_gain * (gap - g_star), vL - A.max_follow_speed_drop_mps)
+    cmd = np.minimum(cmd, np.sqrt(vL * vL + 2 * BRAKING_DECEL * np.maximum(0.0, gap - A.emergency_gap_m)))
+    closing = v_e - np.maximum(0.0, v_lead)
+    ttc = np.where(closing > 0.1, gap / np.maximum(closing, 1e-6), np.inf)
+    cmd = np.where(closing > 0.1, np.minimum(cmd, vL + np.maximum(0.0, gap - A.emergency_gap_m) / A.soft_ttc_sec), cmd)
+    hard = (closing > 0.1) & (ttc <= A.hard_ttc_sec)
+    cmd = np.where(hard, np.minimum(cmd, vL), cmd)
+    zero = (gap <= A.critical_gap_m) | ((closing > 0.1) & (ttc <= A.critical_ttc_sec))
+    cmd = np.where(zero, 0.0, cmd)
+    return np.clip(cmd, 0.0, cruise), hard | zero
+
+
+class _Tv:
+    def __init__(self, v, M, role, accel0):
+        self.uid, self.role, self.lane = v.unique_id, role, v.lane_id
+        self.len, self.wid, self.d0 = v.length, v.width, v.d
+        self.s = np.full(M, float(v.s))
+        self.v = np.full(M, max(0.0, v.v_long))
+        self.v0 = max(0.0, v.v_long)
+        self.a0 = accel0
+        self.lead = None
+        self.out_s = []
+        self.passed = np.zeros(M, dtype=bool)     # passed_front_as_rear: 자차가 지나쳤나(행마다 래치)
+        self.passed_hist = []
+
+
+def target_lane_vehicles(t, vehicles):
+    """(현재 차선 앞차, 목표 차선 앞차, 목표 차선 뒤·옆 차량들). G7 이 보던 차량 전부를 트리가 본다."""
+    cf = t.current_front if t.current_front.valid else None
+    # 목표 차선 차량은 중심 위치로 나눈다: 중심이 자차 앞(delta_s > 0)인 차 중 가장 가까운 차 = 앞차, 중심이 자차 뒤인 차 =
+    # 뒤·옆 차 (실제 ACC 의 앞차 조건과 같은 기준. 선택기의 target_front 는 옆에 겹친 차도 골라 진짜 앞차를 가린다.
+    # C++ rxVehicles 와 같다).
+    tf = None
+    for v in vehicles:
+        if v.valid and v.lane_id == t.target_lane_id and v.delta_s > 0.0 and (tf is None or v.delta_s < tf.delta_s):
+            tf = v
+    seen = set()
+    rears = []
+    for v in vehicles:
+        if not v.valid or v.unique_id in seen or v.lane_id != t.target_lane_id or v.delta_s > 0.0:
+            continue
+        seen.add(v.unique_id)
+        rears.append(v)
+    rears.sort(key=lambda v: -v.s)
+    return cf, tf, rears
+
+
+def joint_rollout(ctx, specs, t, vehicles, P, A, RP, track, branches, accel_of, mid_T_rem=None):
+    """branches: [(rear_mode, front_mode, tb_rule)], tb_rule ∈ {None, 'rear', 'front'} 은 복귀 대응의 분기 시점.
+    mid_T_rem: 차선 변경 도중(모니터)이면 남은 횡이동 시간(blend) — 루트 0 = 지금부터 계속, 대응 1 = 지금 복귀.
+    반환: risk [B,2,N,K], allowed [B,2,N], x/y/v [B,2,N,K], valid [N], mask [N,K]."""
+    from .tree import RETURN_PROGRESS as RET_P, RETURN_PROGRESS_T as RET_T
+    K, dt, W = P.horizon_steps, P.prediction_dt_sec, track.lane_width
+    taus = dt * np.arange(1, K + 1)
+    N, R, B = len(specs), 2, len(branches)
+    M = B * R * N
+    mid = mid_T_rem is not None
+    y_src, y_tgt = track.center_y(ctx.lane), track.center_y(ctx.target_lane)
+    src_end = track.csv_end[ctx.lane]
+    tgt_end = track.csv_end.get(ctx.target_lane, math.inf)
+    half_w = 0.5 * P.ego_width_m
+    cruise = ctx.mission
+    connector = ctx.preview_mode == "connector"
+
+    rep = lambda arr: np.tile(np.asarray(arr), B * R)
+    change = rep([s.change_left for s in specs])
+    t_sw = rep([0.0 if mid else execution_start(s, P) for s in specs])
+    dur = rep([max(0.1, s.duration) for s in specs])
+    act = rep(np.array([s.action for s in specs], dtype=object))
+    prep_a = rep([s.prep_accel for s in specs])
+    resp = np.tile(np.repeat(np.arange(R), N), B)
+    br = np.repeat(np.arange(B), R * N)
+    rear_mode = np.array([branches[b][0] for b in br])
+    front_mode = np.array([branches[b][1] for b in br])
+    tb_rule = np.array([branches[b][2] or "" for b in br])
+    # 머리 넣고 기다리기(NUDGE): 실행 지연 뒤 원 차선 경로 안에서 침범 깊이까지만 횡이동(진행 거리 기반)하고 멈춘다.
+    # 차선 변경이 아니다(change=False): 지평선 끝 완료 검사 없음, 차선 끝 정지는 유지. 복귀 대응·목표 차선 앞차 정상 추종은 받는다.
+    nud = act == NUDGE
+    sgn = 1.0 if y_tgt >= y_src else -1.0
+    # 머리 넣기는 고른 틱에 바로 시작한다(world 가 감독기 전환 지연 없이 plant.nudge_to 를 부른다).
+    # 실행 지연(0.55 s)을 더해 예측하면 실행과 어긋나 모니터(지연 0)가 위험으로 보고 곧바로 빼게 된다.
+    t_nud = rep([max(0.0, s.t_lc) + (P.behavior_execution_delay_sec if RP.nudge_exec_delay else 0.0)
+                 if s.action == NUDGE else np.inf for s in specs])
+    y_nud = rep([y_src + sgn * (0.5 * W - half_w + s.depth) if s.action == NUDGE else np.nan for s in specs])
+    ds_n = np.full(M, np.nan)
+    yn0 = np.full(M, np.nan)
+    Ln = np.full(M, nudge_len(0.0))
+    # probe(머리 넣고 기다렸다가 이어 가기): 뒤차 반응이 드러나는 시점(침범 0.3 m + 반응 지연 + 알아챔 = 복귀 대응의 'rear'
+    # 분기 시점과 같다)에 뒤차 양보 가지는 그 자리에서 차선 변경을 이어 가고, 비양보 가지는 복귀(대응 1) 또는 계속 기다림(대응 0).
+    ngo = rep([s.action == NUDGE and s.go for s in specs])
+    went = np.zeros(M, dtype=bool)
+    creep_n = nud & (ctx.v0 < NUDGE_CREEP_BELOW)          # 정지 근처에서 시작한 머리 넣기만 천천히 전진
+    change, t_sw, dur = change.copy(), t_sw.astype(float), dur.astype(float)
+    yield_floor = max(0.0, ctx.yield_ref_speed - P.behavior_yield_max_speed_drop_mps)
+
+    s = np.full(M, ctx.s0)
+    v = np.full(M, max(0.0, ctx.v0))
+    a = np.zeros(M)
+    f = v.copy()
+    ref_prev = f.copy()
+    y0 = y_tgt + ctx.ego_d_target
+    y = np.full(M, y0)
+    ds_sw = np.where(mid & change, 0.0, np.nan)
+    tau_m = np.where(mid & change, 0.0, np.nan)
+    ret_t = np.full(M, np.inf)
+    y_ret0 = np.zeros(M)
+    y_m = np.full(M, y0 if mid else np.nan)        # 횡이동 시작 때 자차 위치
+    t_in = np.full(M, np.inf)
+    L_rem = max(2.0, ctx.connector_join_arc * abs(ctx.ego_d_target) / W) if mid else max(1.0, ctx.connector_join_arc)
+
+    cf, tf, rears = target_lane_vehicles(t, vehicles)
+    # 앞차보다 더 앞의 목표 차선 차량(tf2): 자차가 느린 앞차를 지나치면 그 다음 차가 앞차가 된다(C++ rxVehicles 와 같다)
+    far = sorted((w for w in vehicles if tf is not None and w.valid and w.lane_id == t.target_lane_id and w.delta_s > 0.0
+                  and w.unique_id != tf.unique_id), key=lambda w: w.delta_s)
+    tvs = ([_Tv(cf, M, "cf", accel_of(cf))] if cf else []) + ([_Tv(tf, M, "tf", accel_of(tf))] if tf else []) + \
+        [_Tv(w, M, "tf2", accel_of(w)) for w in far] + [_Tv(r, M, "rear", accel_of(r)) for r in rears]
+    ctx_rows = []
+    for x in [o for o in tvs if o.role in ("cf", "tf", "tf2")]:
+        ahead = [w for w in vehicles if w.valid and w.lane_id == x.lane and w.s > x.s[0] + 1e-3 and w.unique_id != x.uid]
+        if ahead:
+            w = min(ahead, key=lambda w: w.s)
+            main = [o for o in tvs if o.uid == w.unique_id]      # 리더가 이미 예측하는 차(tf2)면 그 차를 따른다
+            if main:
+                x.lead = main[0]
+            else:
+                c = _Tv(w, M, "ctx", 0.0)
+                ctx_rows.append(c)
+                x.lead = c
+    if RP.passed_front_as_rear:
+        for x in tvs:
+            if x.role in ("tf", "tf2"):
+                x.passed = x.s < s
+    for x in tvs:
+        if x.role == "rear":
+            ahead = [o for o in tvs if o is not x and o.lane == x.lane and o.s[0] > x.s[0]]
+            x.lead = min(ahead, key=lambda o: o.s[0]) if ahead else None
+
+    out_x, out_y, out_v = np.zeros((M, K)), np.zeros((M, K)), np.zeros((M, K))
+    tf_hard_follow = []
+    react_d = 0.0 if RP.rear_revealed else RP.rear_react_delay_s           # 이미 관측했으면 반응도 이미 시작됨
+    rev_t = 0.0 if RP.rear_revealed else RP.rear_react_delay_s + RP.rear_detect_s
+    nud_on = np.zeros(M, dtype=bool)
+    returning = np.zeros(M, dtype=bool)
+    L_arr = np.full(M, L_rem)
+    for k, tau in enumerate(taus):
+        tau0 = tau - dt
+        # ---- 횡 위치 -------------------------------------------------------------------
+        moved = s - ctx.s0
+        if ngo.any() and not mid:
+            # 이어 가기 = 뒤차 반응이 드러난 뒤(복귀 분기 시점과 같다) + 목표 차선 앞·뒤 간격이 열렸을 때(상태 피드백).
+            # 간격이 안 열리면 대응 0 은 계속 기다리고, 비양보 가지의 대응 1 은 그 시점에 복귀한다.
+            gap_ok = np.ones(M, dtype=bool)
+            for x in tvs:
+                if x.role not in ("tf", "tf2", "rear"):
+                    continue
+                behind = x.s + 0.5 * x.len < s - P.ego_rear_extent_m
+                ahead = x.s - 0.5 * x.len > s + P.ego_front_extent_m
+                g_r = (s - P.ego_rear_extent_m) - (x.s + 0.5 * x.len)
+                g_f = (x.s - 0.5 * x.len) - (s + P.ego_front_extent_m)
+                ok_r = (g_r >= np.maximum(RP.go_gap_min_m, RP.go_rear_headway_s * x.v)) & (x.v - v <= RP.go_closing_max_mps)
+                ok_f = g_f >= np.maximum(RP.go_gap_min_m, RP.go_front_headway_s * v)
+                gap_ok &= np.where(behind, ok_r, np.where(ahead, ok_f, False))
+            go = ngo & ~went & nud_on & ~returning & (resp == CONTINUE) & gap_ok & \
+                (tau0 >= t_in + rev_t - 1e-9) & (s <= src_end)
+            if go.any():
+                frac = np.clip(np.abs(y_tgt - y) / W, 0.2, 1.0)
+                went |= go
+                change = change | go
+                t_sw = np.where(go, tau0, t_sw)
+                ds_sw = np.where(go, moved, ds_sw)
+                tau_m = np.where(go, tau0, tau_m)
+                y_m = np.where(go, y, y_m)
+                dur = np.where(go, np.maximum(0.5, dur * frac), dur)
+                L_arr = np.where(go, np.maximum(2.0, ctx.connector_join_arc * frac), L_arr)
+        nud_e = nud & ~went
+        if not mid:
+            start = change & np.isnan(ds_sw) & (tau0 >= t_sw - 1e-6)
+            ds_sw = np.where(start, moved, ds_sw)
+            motion = change & ~np.isnan(ds_sw) & np.isnan(tau_m) & (
+                (v >= P.ego_reference_preview_motion_start_speed_mps) |
+                (moved - np.nan_to_num(ds_sw) >= P.ego_reference_preview_motion_start_distance_m))
+            tau_m = np.where(motion, tau0, tau_m)
+        if connector:
+            u = np.clip((moved - np.nan_to_num(ds_sw)) / L_arr, 0.0, 1.0)
+            alpha = np.where(np.isnan(tau_m), 0.0, u * u * u * (10.0 - 15.0 * u + 6.0 * u * u))
+        else:
+            T = mid_T_rem if mid else dur
+            alpha = np.where(np.isnan(tau_m), 0.0, np.clip((tau0 - np.nan_to_num(tau_m)) / T, 0.0, 1.0))
+        # 횡이동은 그때의 실제 위치에서 시작한다(C++ rxRollout 과 같다; 복귀 뒤 비켜 선 채 다시 승인하는 경우).
+        y_keep = y_src + (y0 - y_src) * math.exp(-tau0 / max(0.1, P.lane_center_decay_tau_sec))
+        y_m = np.where(np.isnan(y_m) & ~np.isnan(tau_m), y_keep, y_m)
+        y_go = np.where(change & ~np.isnan(y_m), y_m + (y_tgt - y_m) * alpha, y_keep)
+        y_go = np.where(change & (s > src_end), y_tgt, y_go)
+        if nud_e.any():
+            st_n = nud_e & np.isnan(ds_n) & (tau0 >= t_nud - 1e-6)
+            ds_n = np.where(st_n, moved, ds_n)
+            yn0 = np.where(st_n, y, yn0)
+            Ln = np.where(st_n, np.maximum(NUDGE_LEN_M, NUDGE_LAT_T * v), Ln)
+            u_n = np.clip((moved - np.nan_to_num(ds_n)) / Ln, 0.0, 1.0)
+            a_n = u_n * u_n * u_n * (10.0 - 15.0 * u_n + 6.0 * u_n * u_n)
+            y_go = np.where(nud_e & np.isnan(ds_n), y0, y_go)          # 시작 전: 지금 위치 유지(이미 머리를 넣었으면 그대로)
+            y_go = np.where(nud_e & ~np.isnan(ds_n), np.nan_to_num(yn0) + (np.nan_to_num(y_nud) - np.nan_to_num(yn0)) * a_n, y_go)
+        nud_on = nud_e & ~np.isnan(ds_n)
+        tb = np.where(tb_rule == "front", RP.front_detect_s,
+             np.where(tb_rule == "rear", t_in + rev_t, np.inf))
+        tb = np.where(tb_rule == "now", 0.0, tb)        # 실행 중 모니터: 지금 복귀
+        begin = (resp == RETURN) & (change | nud_on) & np.isinf(ret_t) & (tau0 >= tb - 1e-9) & (np.abs(y - y_tgt) > RP.abort_before_abs_d)
+        if k == 0:
+            begin &= np.abs(y0 - y_tgt) > RP.abort_before_abs_d
+        ret_t = np.where(begin, tau0, ret_t)
+        y_ret0 = np.where(begin, y if k else y0, y_ret0)
+        returning = np.isfinite(ret_t)
+        scale = np.maximum(0.35, np.sqrt(np.minimum(1.0, np.abs(y_ret0 - y_src) / W)))
+        fr = np.interp(np.maximum(0.0, tau0 - np.where(returning, ret_t, tau0)) / scale, RET_T, RET_P)
+        y = np.where(returning, y_ret0 + (y_src - y_ret0) * fr, y_go)
+        d_t = np.abs(y - y_tgt)
+        intr = 0.5 * W + half_w - d_t
+        t_in = np.where(np.isinf(t_in) & (intr >= RP.rear_react_intrusion_m), tau0, t_in)
+        in_target = d_t < 0.5 * W
+        lc_active = change & (tau0 >= t_sw) & ~returning
+        nud_on = nud_on & ~returning
+
+        # ---- 타겟 차량 -----------------------------------------------------------------
+        new = []
+        for x in tvs:
+            if x.lead is not None:
+                gap_l = x.lead.s - 0.5 * x.lead.len - x.s - 0.5 * x.len
+                if x.role == "rear":
+                    base = _idm(x.v, gap_l, x.lead.v, max(x.v0, 0.5), RP.rear_idm_a, RP.rear_idm_b, RP.rear_idm_s0, RP.rear_idm_T)
+                else:
+                    base = _idm(x.v, gap_l, x.lead.v, max(x.v0, 0.5), RP.front_idm_a, RP.front_idm_b, RP.front_idm_s0, RP.front_idm_T)
+            else:
+                base = np.full(M, x.a0 * math.exp(-tau0 / RP.accel_decay_s))
+            if x.role in ("cf", "tf"):
+                a_acc = np.where(x.v < x.v0 + 5.0, RP.front_accel, 0.0)
+                if x.lead is not None:      # 가속 예외도 자기 앞차는 뚫고 지나가지 않는다(C++ rxRollout 과 같다)
+                    a_acc = np.minimum(a_acc, _idm(x.v, gap_l, x.lead.v, x.v0 + 5.0, RP.front_idm_a, RP.front_idm_b,
+                                                   RP.front_idm_s0, RP.front_idm_T))
+                acc = np.where(front_mode == "brake", RP.front_brake, np.where(front_mode == "accel", a_acc, base))
+            elif x.role == "tf2":
+                acc = base
+            else:
+                acc = None
+            if acc is not None and RP.passed_front_as_rear and x.role in ("tf", "tf2"):
+                # 지나친 목표 차선 앞차 = 뒤차(C++ rxRollout 과 같다)
+                react = (rear_mode == "yield") & (tau0 >= t_in + react_d - 1e-9) & (intr > 0.0) & (s > x.s)
+                gap_e = (s - P.ego_rear_extent_m) - (x.s + 0.5 * x.len)
+                a_e = _idm(x.v, gap_e, v, max(x.v0, 0.5), RP.rear_idm_a, RP.rear_idm_b, RP.rear_idm_s0, RP.rear_idm_T)
+                acc = np.where(x.passed, np.maximum(np.where(react, np.minimum(base, a_e), base), -RP.rear_max_brake), acc)
+            if acc is None:
+                react = (rear_mode == "yield") & (tau0 >= t_in + react_d - 1e-9) & (intr > 0.0) & (s > x.s)
+                gap_e = (s - P.ego_rear_extent_m) - (x.s + 0.5 * x.len)
+                a_e = _idm(x.v, gap_e, v, max(x.v0, 0.5), RP.rear_idm_a, RP.rear_idm_b, RP.rear_idm_s0, RP.rear_idm_T)
+                acc = np.maximum(np.where(react, np.minimum(base, a_e), base), -RP.rear_max_brake)
+            vn = np.maximum(0.0, x.v + acc * dt)
+            new.append((x, x.s + 0.5 * (x.v + vn) * dt, vn))
+
+        # ---- 자차 ACC 목표 속도 (acc.py AccPlanner.step 과 같은 규칙) --------------------------
+        # 미션 속도: 차선 전환(t_sw) 뒤부터 mission_ramp 로 cruise_max 까지 회복(MORAI 대회 스택). 시뮬은 일정.
+        if RP.mission_ramp > 0 and RP.cruise_max > 0:
+            cruise_k = np.minimum(RP.cruise_max, cruise + RP.mission_ramp * np.maximum(0.0, tau0 - np.where(change, t_sw, np.inf)))
+        else:
+            cruise_k = np.full(M, cruise)
+        raw = cruise_k.copy()
+        hard = np.zeros(M, dtype=bool)
+        soft_bind = np.zeros(M, dtype=bool)
+        bind_c = np.full(M, np.nan)
+        bind_g = np.full(M, np.nan)
+        c_max = np.zeros(M)
+        front_ahead = np.zeros(M, dtype=bool)      # 더 가까운 목표 차선 앞차가 아직 자차 앞에 있나
+        floor_block = np.zeros(M, dtype=bool)      # merge_floor: 8 m 안 앞차 또는 80 m 안 느린 앞차
+        tf_blocks = np.zeros(M, dtype=bool)        # merge_floor: 목표 차선 앞차가 11 m 안
+        for x in tvs:
+            if x.role == "cf":
+                use, allow_hard = ~in_target | returning, np.ones(M, dtype=bool)
+            elif x.role in ("tf", "tf2"):
+                # 목표 차선 앞차: 중앙 0.75 m 안(또는 이미 그 차선)이면 정상 추종, 차선 변경 중 2.7 m 안이면
+                # 약한 추종(감속 ≤ 1.5 m/s², hard 없음) — acc.py candidates
+                entry = d_t <= A.target_front_acc_entry_abs_d_m
+                if RP.tf_on_start:              # 실행 시작부터 정상 추종(현재 차선 앞차와 함께 → 낮은 속도)
+                    use = entry | lc_active | nud_on
+                    allow_hard = use
+                else:
+                    use = entry | (lc_active & (d_t <= A.target_front_overlap_soft_acc_start_abs_d_m)) | nud_on
+                    allow_hard = entry | nud_on     # 머리 넣기는 목표 차선 앞차 뒤에 속도를 맞춘다
+            else:
+                continue
+            gap = (x.s - 0.5 * x.len) - (s + P.ego_front_extent_m)
+            ahead = gap > -x.len
+            closer_ahead = front_ahead
+            if x.role == "tf2":         # 더 가까운 앞차를 모두 지나친 뒤에만 따른다(선택기·ACC 가 그때 그 차를 앞차로 잡는다)
+                use = use & ~front_ahead
+            if x.role != "cf":
+                front_ahead = front_ahead | ahead
+            if RP.merge_floor:          # 하한 판정(C++ rxRollout 과 같다): 따르든 말든 앞에 있는 현재·목표 차선 앞차
+                inf = x.s > s
+                if x.role == "cf":
+                    chk = ~in_target | returning
+                elif x.role == "tf":
+                    chk = np.ones(M, dtype=bool)
+                else:
+                    chk = ~closer_ahead
+                floor_block |= inf & chk & ((gap <= A.merge_keep_rolling_front_block_gap_m) |
+                                            ((x.v <= A.merge_keep_rolling_low_speed_lead_mps) &
+                                             (gap <= A.merge_keep_rolling_low_speed_lead_max_gap_m)))
+                if x.role == "tf":
+                    tf_blocks |= inf & (gap <= A.min_target_front_gap_m)
+            cmd, hd = speed_for_lead(gap, x.v, v, cruise_k, A)
+            c = np.maximum(0.0, v - np.minimum(np.maximum(x.v, 0.0), cruise_k))
+            closing = v - np.maximum(0.0, x.v)
+            rapid = (A.rapid_lead_brake_enabled & (c >= A.rapid_lead_min_closing_speed_mps) &
+                     ((gap / np.maximum(closing, 1e-6) <= A.rapid_lead_ttc_sec) |
+                      ((gap > A.emergency_gap_m) & (c * c / (2 * np.maximum(gap - A.emergency_gap_m, 1e-6)) >= 5.0))))
+            act_l = use & ahead
+            c_max = np.where(act_l, np.maximum(c_max, c), c_max)
+            take = act_l & (cmd < raw)
+            raw = np.where(take, cmd, raw)
+            soft_bind = np.where(take, ~allow_hard, soft_bind)
+            bind_c = np.where(take, c, bind_c)
+            bind_g = np.where(take, gap, bind_g)
+            hard |= act_l & (hd | rapid) & allow_hard
+        dist = src_end - s
+        stay = ~lc_active & ~in_target & (dist < 200.0)
+        merge_wait = np.zeros(M, dtype=bool)
+        if RP.merge_floor:
+            # 차선 끝 대기 = 차선 변경 전 · 급함 · 목표 차선 앞차 11 m 안(acc mergeWaitStopRequired). 이때만 차선 끝에서 선다.
+            urgent = bool(t.lane_change_required) & ((dist <= RP.floor_urgent_distance_m) |
+                                                     ((v > 0.1) & (dist / np.maximum(v, 0.1) <= RP.floor_urgent_time_s)))
+            merge_wait = ~lc_active & urgent & tf_blocks
+            stay &= merge_wait
+        stay = stay & ~nud_e                               # 머리 넣기는 대기선에 서지 않고 차선 끝 근처까지 천천히 전진(아래)
+        merge_wait = merge_wait | nud_e                    # 합류 하한(merge_keep_rolling)은 걸지 않는다
+        lim_stay = np.sqrt(2.0 * RP.lane_end_decel * np.maximum(0.0, dist - A.lane_end_merge_wait_stop_distance_m))
+        lim = stay & (lim_stay < raw)
+        raw = np.where(lim, lim_stay, raw)
+        soft_bind &= ~lim
+        bind_c = np.where(lim, np.nan, bind_c)
+        if RP.merge_floor and A.merge_keep_rolling_enabled:
+            # 실제 ACC merge_keep_rolling 하한: 앞차·차선 끝 제한 뒤, 차선 변경 중 차선 끝·HOLD/YIELD·connector 상한 앞
+            pressure = lc_active | bool(t.lane_change_required and (t.lane_change_prepare or t.lane_change_urgent or
+                                                                    t.emergency_stop_required))
+            stop_zone = np.zeros(M, dtype=bool)
+            if ctx.target_lane in list(A.lane_end_stop_lane_ids):
+                d3 = tgt_end - s
+                stop_zone = in_target & ~returning & ((d3 <= A.lane_end_stop_prepare_distance_m) |
+                                                      ((v > 0.1) & (d3 / np.maximum(v, 0.1) <= A.lane_end_stop_prepare_time_sec)))
+            fl = np.minimum(max(0.0, A.merge_keep_rolling_min_speed_mps), cruise_k)
+            lift = ~hard & ~merge_wait & ~floor_block & pressure & ~stop_zone & (fl > 1e-3) & (raw < fl)
+            raw = np.where(lift, fl, raw)
+            soft_bind &= ~lift
+        elapsed = np.maximum(0.0, tau0 - t_sw)
+        lim_lc = np.minimum(np.maximum((dist - A.lane_change_lane_end_margin_m) / np.maximum(0.5, 4.2 - elapsed),
+                                       np.minimum(A.lane_change_lane_end_min_cap_mps, cruise_k)), cruise_k)
+        # 실제 ACC 처럼 connector 실행 중에는 걸지 않는다(C++ rxRollout, acc_speed_planner !endpoint_connector_active)
+        lim = lc_active & (not connector) & (d_t > A.lane_change_lane_end_cap_release_abs_d_m) & (lim_lc < raw)
+        raw = np.where(lim, lim_lc, raw)
+        soft_bind &= ~lim
+        bind_c = np.where(lim, np.nan, bind_c)
+        pre = ~(change & (tau0 >= t_sw))
+        cap = np.where(act == HOLD, ctx.v0,
+              np.where(act == YIELD, np.maximum(yield_floor, ctx.v0 + prep_a * tau0),
+              np.where(act == ACCEL, np.minimum(cruise_k, ctx.v0 + prep_a * tau0), np.inf)))
+        lim = pre & (cap < raw)
+        raw = np.where(lim, cap, raw)
+        soft_bind &= ~lim
+        bind_c = np.where(lim, np.nan, bind_c)
+        if connector and RP.connector_cap:     # ACC 정지 connector 속도 상한(목표 차선별, C++ rxRollout 과 같다)
+            by_lane = P.stopped_launch_connector_speed_cap_by_target_lane_mps
+            tgt = min(max(int(ctx.target_lane), 0), 3)
+            cap_conn = by_lane[tgt] if tgt < len(by_lane) else P.stopped_launch_connector_speed_cap_mps
+            raw = np.where(lc_active, np.minimum(raw, cap_conn), raw)
+        if nud_e.any():                        # 머리 넣기: 차선 끝 3 m 앞까지(정지 근처에서 시작했으면 ≤ 2 m/s 로 천천히)
+            lim_n = np.sqrt(2.0 * RP.lane_end_decel * np.maximum(0.0, dist - NUDGE_STOP_M))
+            lim_n = np.where(creep_n, np.minimum(NUDGE_CREEP_MPS, lim_n), lim_n)
+            lim = nud_e & (lim_n < raw)
+            raw = np.where(lim, lim_n, raw)
+            soft_bind &= ~lim
+            bind_c = np.where(lim, np.nan, bind_c)
+        # 필터: 감속 한계 = hard 12 / 기본 7 + 접근 속도 가산(최대 11), 약한 추종 1.5, 앞차 요구 감속 한계
+        boost = np.clip((c_max - A.closing_decel_boost_start_mps) /
+                        (A.closing_decel_boost_full_mps - A.closing_decel_boost_start_mps), 0.0, 1.0)
+        dec = np.where(hard, 12.0, RP.acc_dn + boost * (11.0 - RP.acc_dn))
+        dec = np.where(soft_bind, np.minimum(dec, 1.5), dec)
+        if A.lead_required_decel_limit_enabled:
+            margin = bind_g - A.emergency_gap_m - A.lead_required_decel_limit_headway_sec * v
+            lim = ~np.isnan(bind_c) & ~hard & (margin > 0.5)
+            req = np.maximum(1.5, A.lead_required_decel_limit_gain * np.nan_to_num(bind_c) ** 2 /
+                             (2 * np.maximum(np.nan_to_num(margin), 1e-6)))
+            dec = np.where(lim, np.minimum(dec, req), dec)
+        bypass = hard & A.hard_brake_bypass_filter
+        f = np.where(bypass, raw, np.clip(raw, f - dec * dt, f + RP.acc_up * dt))
+        f = np.clip(f, 0.0, cruise_k)
+        tf_hard_follow.append(np.zeros(M, dtype=bool) if tf is None else (d_t <= A.target_front_acc_entry_abs_d_m))
+
+        # ---- 자차 응답 -----------------------------------------------------------------
+        ff = (f - ref_prev) / dt
+        ref_prev = f
+        a_des = np.clip((f - v) / RP.plant_tau + ff, np.where(f < 0.01, RP.plant_a_stop, RP.plant_a_min), RP.plant_a_max)
+        a = a + np.clip(a_des - a, -RP.plant_jerk * dt, RP.plant_jerk * dt)
+        a = np.where((v <= 0.0) & (a < 0.0), 0.0, a)
+        vn = np.maximum(0.0, v + a * dt)
+        s = s + 0.5 * (v + vn) * dt
+        v = vn
+        for x, sn, vx in new:
+            x.s, x.v = sn, vx
+            if RP.passed_front_as_rear and x.role in ("tf", "tf2"):
+                x.passed = x.passed | (s > x.s)
+            x.passed_hist.append(x.passed.copy())
+            x.out_s.append(sn)
+        for c in ctx_rows:
+            c.s = c.s + c.v * dt
+        out_x[:, k], out_y[:, k], out_v[:, k] = s, y, v
+
+    # ---- 위험 ----------------------------------------------------------------------------
+    no_coll = np.ones((M, K))
+    per_tv = []
+    for x in tvs:
+        tx = np.stack(x.out_s, axis=1)
+        ty = (track.center_y(x.lane) + x.d0 * np.exp(-taus / max(0.1, P.lane_center_decay_tau_sec)))[None, :]
+        front = x.role in ("cf", "tf")
+        pf = np.stack(x.passed_hist, axis=1)          # 지나친 목표 차선 앞차 = 뒤차 σ, 앞차 급감속 모드 없음
+        brake_rows = ((front_mode == "brake")[:, None] & ~pf) if front else np.zeros((M, 1), dtype=bool)
+        if x.role == "cf":
+            t_sig = np.minimum(taus, RP.follow_sigma_cap_s)[None, :]
+        elif x.role in ("tf", "tf2"):
+            t_sig = np.where(np.stack(tf_hard_follow, axis=1) & ~pf, np.minimum(taus, RP.follow_sigma_cap_s)[None, :], taus[None, :])
+        else:
+            t_sig = taus[None, :]
+        if RP.sigma_cap_s is not None:                # 진단용: σ 가 이 시각 뒤로 더 커지지 않게
+            t_sig = np.minimum(t_sig, RP.sigma_cap_s)
+        t_lat = None if RP.lat_sigma_cap_s is None else np.minimum(t_sig, RP.lat_sigma_cap_s)
+        cn, _ = collision_probability(out_x, out_y, 0.0, t_sig, tx, ty, 0.0, x.len, x.wid, "nominal", P, t_lat=t_lat)
+        if brake_rows.any():
+            cb, _ = collision_probability(out_x, out_y, 0.0, t_sig, tx, ty, 0.0, x.len, x.wid, "front_brake", P, t_lat=t_lat)
+            cn = np.where(brake_rows, cb, cn)
+        alive = tx <= track.csv_end.get(x.lane, math.inf) + 1e-6
+        no_coll *= 1.0 - np.where(alive, cn, 0.0)
+        if RP.debug_per_tv:
+            per_tv.append((x.uid, x.role, x.lane, np.where(alive, cn, 0.0)))
+    risk = 1.0 - no_coll
+
+    shp = lambda z: z.reshape(B, R, N, *z.shape[1:])
+    X, Y = shp(out_x), shp(out_y)
+    # 유효성: 계속 대응·첫 가지 기준. 차선 변경 루트는 움직이기 시작해 지평선 끝에 목표 차선에 있어야 하고
+    # (목표 차선 CSV 가 먼저 끝나면 그 끝까지), 정지 connector 는 출발 전 0.5 m 이내. 원 차선 유지는 차선 끝 전.
+    x0, y0r = X[0, 0], Y[0, 0]
+    chg = np.array([sp.change_left for sp in specs])
+    valid = np.ones(N, dtype=bool)
+    if not mid:
+        valid &= ~chg | ~np.isnan(tau_m[:N])
+        if connector:
+            valid &= ~chg | (np.nan_to_num(ds_sw[:N], nan=0.0) <= P.stopped_launch_connector_max_preswitch_distance_m)
+    if getattr(P, "fit_relax_after_start_s", None) is None:      # 완화 옵션이면 지평선 끝 완료 검사를 하지 않는다
+        valid &= ~chg | (np.abs(y0r[:, -1] - y_tgt) <= P.ego_reference_preview_target_completion_max_abs_d_m) | (x0[:, -1] > tgt_end)
+    went0 = went.reshape(B, R, N)[0, 0]
+    valid &= chg | went0 | (x0[:, -1] <= src_end + 1e-6)
+    valid &= ~went0 | (np.abs(y0r[:, -1] - y_tgt) <= P.ego_reference_preview_target_completion_max_abs_d_m) | \
+        (x0[:, -1] <= src_end + 1e-6)
+    mask = x0 <= tgt_end + 1e-6
+    risk = shp(risk) * mask[None, None]
+    allowed = shp(np.where(resp == RETURN, np.isfinite(ret_t), True))
+    return {"risk": risk, "allowed": allowed, "x": X, "y": Y, "v": shp(out_v), "valid": valid, "mask": mask,
+            "taus": taus, "tv_s": [(x.uid, shp(np.stack(x.out_s, axis=1))) for x in tvs],
+            "tv_meta": [(x.uid, x.lane, x.len, x.role, float(x.s[0])) for x in tvs],
+            "risk_tv": [(u, ro, ln, shp(a) * mask[None, None]) for u, ro, ln, a in per_tv] if RP.debug_per_tv else None}
+
+
+def load_acc_params():
+    return load_params("acc_planner")
