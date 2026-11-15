@@ -24,6 +24,15 @@ from .reactive import CONTINUE, RETURN, ReactiveParams, joint_rollout, load_acc_
 from .rollouts import CHANGE_NOW, NUDGE, ActionSpec, RolloutContext
 from .tree import RETURN as TREE_RETURN, TreePlanner
 
+ABORT_COST = 2.0      # J 의 중단 가중(rl/terminal_cost.py 와 같다)
+
+
+def _root0(mask):
+    """루트 0 만 남긴 마스크(잎 학습판 RV·RA 는 지금 바꾸기 루트에만 쓴다)."""
+    m = np.zeros_like(mask)
+    m[0] = mask[0]
+    return m
+
 
 @dataclass
 class _Roots:
@@ -116,6 +125,26 @@ class ReactiveTreePlanner(TreePlanner):
         best_cost = np.full(N, np.inf)
         best_combo = np.zeros((N, B + 1), dtype=int)
         best_risk = np.ones(N)
+        raw_risk = np.ones(N)                              # 꼬리 항(TR 등)을 넣기 전 지평선 안 위험(위험 기록용)
+        TV = None                                          # 학습한 종단 비용(TC) [B, 2, N]: τ + V(잎)
+        if getattr(self, "tc_fn", None) is not None and getattr(self, "_roots_eval", False) \
+                and not getattr(self, "_mon_eval", False):
+            from .rl.terminal_cost import leaf_costs
+            TV = leaf_costs(self, r, mask, self.tc_fn)
+            self._tc_root = np.full(N, np.inf)             # TC 루트 값(기회 제약을 지키는 대응 중 최소). 모니터의 _solve 는 건드리지 않는다
+            self._tc_combo, self._tc_p = {}, p             # 루트마다 그 최소를 준 가지별 대응(수집 기록용)
+        cost_j = np.array([0.0, ABORT_COST])               # TC: 대응 비용은 J 의 중단 가중(복귀 = 2 s)
+        RV = None                                          # RL 위험 값(RV) [B, 2, N]: 잎에서 이 차선 변경을 마칠 때까지의 최대 위험
+        if getattr(self, "rv_fn", None) is not None and getattr(self, "_roots_eval", False) \
+                and (not getattr(self, "_mon_eval", False) or getattr(self, "rv_monitor", False)):
+            from .rl.risk_value import leaf_risk
+            RV = leaf_risk(self, r, _root0(mask) if getattr(self.rv_fn, "leaf", False) else mask, self.rv_fn)
+            # 잎 학습판: 명령(지금 바꾸기) 루트 0 의 잎만 계산(나머지 루트는 0)
+        AV = None                                          # RL 중단 값(RA) [B, 2, N]: 잎에서 이 차선 변경을 마칠 때까지의 중단 기댓값
+        if getattr(self, "ra_fn", None) is not None and getattr(self, "_roots_eval", False) \
+                and not getattr(self, "_mon_eval", False):
+            from .rl.risk_value import leaf_risk
+            AV = leaf_risk(self, r, _root0(mask) if getattr(self.ra_fn, "leaf", False) else mask, self.ra_fn)
         TT = None                                          # 학습한 꼬리 위험(TR) [B, 2, N]: 지평선 뒤 같은 가지의 최대 위험
         if getattr(self, "tail_fn", None) is not None and getattr(self, "_roots_eval", False):
             from .rl.tail_risk import leaf_inputs
@@ -142,19 +171,50 @@ class ReactiveTreePlanner(TreePlanner):
                 rk += p[b] * r["risk"][b, q, i]
                 jc += p[b] * cost_r[q]
             peak = rk.max(axis=1)
+            peak_raw = peak
             if TT is not None:                             # 꼬리 최댓값의 위 한계 Σ_b p_b TR_b 와 지평선 안 최댓값 중 큰 값
                 peak = np.maximum(peak, sum(p[b] * TT[b, combos[:, b], i] for b in range(B)))
-            total = root_cost[i] + jc + c.risk_weight * peak
+            peak_cost = peak
+            if RV is not None:                             # 지평선 뒤 최대 위험(RL): 전체 최댓값 = max(지평선 안, 뒤)
+                tail = sum(p[b] * RV[b, combos[:, b], i] for b in range(B))
+                if tail.ndim == 2:                         # 시점별(RVT): max_j Σ_b p_b V_bj = SMPC 와 같은 순서
+                    tail = tail.max(axis=1)
+                both = np.maximum(peak, tail)
+                if not getattr(self, "rv_constraint_only", False):  # RVg = 기회 제약에만(비용은 지평선 안 그대로)
+                    peak_cost = both
+                if not getattr(self, "rv_cost_only", False):   # RV = 종단 제약(기회 제약에도), RVc = 종단 비용(비용에만)
+                    peak = both
+            total = root_cost[i] + jc + c.risk_weight * peak_cost
+            if AV is not None:                             # 지평선 뒤 중단도 지평선 안 복귀와 같은 값(30)으로 매긴다
+                total = total + cost_r[1] * sum(p[b] * AV[b, combos[:, b], i] for b in range(B))
             good = ok & (peak <= eps)
+            if TV is not None:                             # TC: 루트 값 = Σ_b p_b [대응 비용 + τ + V(잎)]
+                tc_total = sum(p[b] * (cost_j[combos[:, b]] + TV[b, combos[:, b], i]) for b in range(B))
+                if good.any():
+                    kt = int(np.argmin(np.where(good, tc_total, np.inf)))
+                    self._tc_root[i], self._tc_combo[i] = tc_total[kt], combos[kt]
+                if not getattr(self, "tc_binary", False):  # 전체 모드: 모든 루트를 TC 값으로 고른다(휴리스틱 루트 비용 없음)
+                    total = tc_total
             if good.any():
                 k = int(np.argmin(np.where(good, total, np.inf)))
                 feas[i], best_cost[i], best_risk[i] = True, total[k], peak[k]
+                raw_risk[i] = peak_raw[k]
             elif ok.any():
                 k = int(np.argmin(np.where(ok, peak, np.inf)))
                 best_risk[i] = peak[k]
+                raw_risk[i] = peak_raw[k]
             # TreePlanner 형식: [0] 은 nominal 자리, 이후 가지별 대응(복귀 = TREE_RETURN)
             best_combo[i, 1:] = np.where(combos[k] == RETURN, TREE_RETURN, 0) if (good.any() or ok.any()) else 0
         self.last_tree = {"branches": [(f"{b[0]}/{b[1]}", round(b[3], 3), b[2]) for b in br]}
+        self._raw_risk = raw_risk
+        if getattr(self, "leaf_log", None) is not None and getattr(self, "_roots_eval", False) \
+                and not getattr(self, "_mon_eval", False) and mask[0] and feas[0]:
+            from .rl.risk_value import leaf_features
+            m0 = np.zeros(N, dtype=bool)
+            m0[0] = True
+            F, _, arr = leaf_features(self, r, m0)[0]
+            q = (best_combo[0, 1:] == TREE_RETURN).astype(int)
+            self._leaf0 = (F, arr, p, q)                 # world 가 지금 바꾸기를 명령한 틱에 기록한다
         return feas, best_cost, best_combo, best_risk, br
 
     # ------------------------------------------------------------ 모니터
@@ -162,7 +222,18 @@ class ReactiveTreePlanner(TreePlanner):
         self.mission = mission
         self.hist.update(t, now)
         self._update_rear_belief(now, t)
-        return self.monitor_core(t, v_e, mission, connector=self.lc_connector)
+        self._mon_raw = None
+        mh = getattr(self, "mon_horizon", None)          # 'MhNN': 모니터만 지평선 NN 스텝(분해 실험)
+        if mh:
+            h0, self.P.horizon_steps = self.P.horizon_steps, mh
+        try:
+            out = self.monitor_core(t, v_e, mission, connector=self.lc_connector)
+        finally:
+            if mh:
+                self.P.horizon_steps = h0
+        if getattr(self, "risk_log", None) is not None and self._mon_raw is not None:
+            self.risk_log.append((now, self._mon_raw, "mon"))     # 실행 중: 계속했을 때의 지평선 안 위험
+        return out
 
     def _update_rear_belief(self, now, t):
         """뒤차 양보 여부 관측 갱신. 자차가 목표 차선에 기준 이상 들어간 뒤 반응 지연 + 알아채는 시간이 지났는데
@@ -192,6 +263,23 @@ class ReactiveTreePlanner(TreePlanner):
         return rp
 
     def nudge_monitor_tick(self, now, t, v_e, mission):
+        mh = getattr(self, "mon_horizon", None)
+        if not mh:
+            return self._nudge_monitor_tick(now, t, v_e, mission)
+        h0, self.P.horizon_steps = self.P.horizon_steps, mh
+        try:
+            return self._nudge_monitor_tick(now, t, v_e, mission)
+        finally:
+            self.P.horizon_steps = h0
+
+    def _rv_back(self, r, p):
+        """RVm: 지금 복귀(빼기) 쪽의 지평선 뒤 위험 Σ_b p_b V_b(복귀 잎). RV 를 모니터에 안 쓰면 0."""
+        if getattr(self, "rv_fn", None) is None or not getattr(self, "rv_monitor", False):
+            return 0.0
+        from .rl.risk_value import leaf_risk, tail_peak
+        return tail_peak(p, leaf_risk(self, r, np.ones(1, dtype=bool), self.rv_fn)[:, RETURN, 0])
+
+    def _nudge_monitor_tick(self, now, t, v_e, mission):
         """머리 넣은 동안 매 틱(world 가 부른다): 뒤차 양보 관측 갱신 + 남기 대 지금 빼기 위험 비교.
         차선 변경 모니터(monitor_core)와 같은 규칙: 남기 위험(가지별 나중 대응 포함) > abort_risk_factor·ε 이고
         빼기 위험이 더 작으면 'return'."""
@@ -219,11 +307,17 @@ class ReactiveTreePlanner(TreePlanner):
         if not r["allowed"][:, RETURN, 0].all():
             return None
         back = float((p[:, None] * r["risk"][:, RETURN, 0]).sum(axis=0).max())
+        back = max(back, self._rv_back(r, p))
         br2 = [(b[0], b[1], "now" if (b[2] == "rear" and rev) else b[2], b[3]) for b in br]
         r2 = joint_rollout(ctx, [spec], t, self._vehicles(t), P2, self.A, rp, self.track,
                            [b[:3] for b in br2], self._accel_of)
+        if getattr(self, "rv_monitor", False):           # _solve 가 RV 를 쓰도록(루트 = 남기 하나)
+            self._specs, self._roots_eval, self._mon_eval = [spec], True, True
         _, _, _, risk2, _ = self._solve(r2, br2, np.zeros(1), np.ones(1, dtype=bool), P.risk_epsilon)
+        self._roots_eval, self._mon_eval = False, False
         stay = float(risk2[0])
+        if getattr(self, "risk_log", None) is not None:
+            self.risk_log.append((now, float(self._raw_risk[0]), "nudge"))
         self.last_nudge_mon = (round(stay, 4), round(back, 4), self.p_rear_post)
         if stay > c.abort_risk_factor * P.risk_epsilon and back < stay:
             return "return"
@@ -255,6 +349,7 @@ class ReactiveTreePlanner(TreePlanner):
         if not r["allowed"][:, RETURN, 0].all():
             return None
         back = (p[:, None] * r["risk"][:, RETURN, 0]).sum(axis=0).max()
+        back = max(back, self._rv_back(r, p))
         if getattr(self, "tail_fn", None) is not None:
             # 학습한 꼬리 위험(TR): 모니터도 지평선 뒤 위험을 본다(계속·지금 복귀 각각 Σ_b p_b TR_b 와 비교)
             from .rl.tail_risk import leaf_inputs
@@ -265,17 +360,22 @@ class ReactiveTreePlanner(TreePlanner):
                 TT[b, q] = v
             go = max(go, float((p * TT[:, CONTINUE]).sum()))
             back = max(back, float((p * TT[:, RETURN]).sum()))
+        if getattr(self, "rv_monitor", False) and getattr(self, "rv_fn", None) is not None and not c.monitor_tree:
+            from .rl.risk_value import leaf_risk, tail_peak
+            go = max(go, tail_peak(p, leaf_risk(self, r, np.ones(1, dtype=bool), self.rv_fn)[:, CONTINUE, 0]))
         cont = go
+        self._mon_raw = float((p[:, None] * r["risk"][:, CONTINUE, 0]).sum(axis=0).max())
         if c.monitor_tree:
             # 계속 쪽도 승인처럼 가지별 나중 대응(앞차 급감속은 알아챈 뒤, 뒤차 비양보는 관측했으면 지금)을 넣어 푼다
             br2 = [(b[0], b[1], "now" if (b[2] == "rear" and self.p_rear_post is not None) else b[2], b[3]) for b in br]
             r2 = joint_rollout(ctx, [mon_spec], t, self._vehicles(t), P, self.A, rp,
                                self.track, [b[:3] for b in br2], self._accel_of, mid_T_rem=T_rem)
-            if getattr(self, "tail_fn", None) is not None:      # _solve 가 TR 을 쓰도록(루트 = 이 모니터 루트 하나)
-                self._specs, self._roots_eval, self._mon_eval = [mon_spec], True, True
+            if getattr(self, "tail_fn", None) is not None or getattr(self, "rv_monitor", False):
+                self._specs, self._roots_eval, self._mon_eval = [mon_spec], True, True   # _solve 가 TR·RV 를 쓰도록
             _, _, _, risk2, _ = self._solve(r2, br2, np.zeros(1), np.ones(1, dtype=bool), P.risk_epsilon)
             self._roots_eval, self._mon_eval = False, False
             cont = float(risk2[0])
+            self._mon_raw = float(self._raw_risk[0])
         if cont > c.abort_risk_factor * P.risk_epsilon and back < cont:
             return "return"
         return None
@@ -306,19 +406,33 @@ def make_reactive_planner(name):
     예: rx_mt_pf_fl_tfs_rr_ng6_nv20_nm_h10_rf10@models/TR.pt
     RL 모니터: '<플래너>_RCNN@<RC 가중치>' = RC(rl/risk_critic.py) > NN/100 이면 '지금 바꾸기'를 막는다.
       'rcf' = RC 가 막은 틱에는 차선 끝 전에 설 수 있는 준비 후보만 남긴다.
-    예: rx_mt_pf_fl_tfs_rr_ng6_nv20_nm_h10_rf10_rcf_RC50@models/RC.pt"""
+    예: rx_mt_pf_fl_tfs_rr_ng6_nv20_nm_h10_rf10_rcf_RC50@models/RC.pt
+    학습한 종단 비용: '<플래너>_TC@<TC 가중치>' = 루트 값 = Σ_b p_b [대응 비용 + τ + V(잎)](rl/terminal_cost.py),
+      기다리기 루트 추가, 문턱 없음.
+      '_TCb@' = 지금 바꾸기와 기다리기만 TC 값으로 비교한다. 바꾸기가 비싸면 지금 바꾸지 않고, 준비 후보는 기존 SMPC 비용으로 고른다.
+      '_TCr@' = TC 값을 계산만 하고 판단은 기존 플래너 그대로(수집·관측용).
+    분해 실험: '_G5' = 5 s 지평선판이 같은 틱에 지금 바꾸기를 고를 때만 지금 바꾼다.
+      '_MhNN' = 실행 중 모니터(차선 변경·머리 넣기)만 지평선 NN 스텝, 판단은 hNN 그대로.
+    RL 위험 값: '_RV@<RV 가중치>' = 판단의 기회 제약·비용에 지평선 뒤 최대 위험 Σ_b p_b V_b(rl/risk_value.py),
+      '_RA@<RA 가중치>' = 루트 비용에 Σ_b p_b · 30 · A(잎_b)(지평선 뒤 중단 기댓값, 30 = 기존 복귀 대응 비용),
+      둘 다: '_RV_RA@<RV>+<RA>'. '_RVc@' = 비용에만, '_RVg@' = 기회 제약에만(잎 학습판은 루트 0 에만 붙어 비용에 넣으면 기다리기 쪽으로 기운다), 'RVm' 을 더하면 실행 중 모니터의 계속·복귀 위험에도 같은 값을 쓴다(문턱은 기존 2ε)."""
     from .tree import TreeConfig
-    tr_path, rc_path, rc_th = None, None, None
+    tr_path, rc_path, rc_th, tc_path, rv_path = None, None, None, None, None
     if "@" in name:
         name, tr_path = name.split("@", 1)
         rc_th = next((int(f[2:]) / 100.0 for f in name.split("_") if f.startswith("RC") and f[2:].isdigit()), None)
         if rc_th is not None:
             rc_path, tr_path = tr_path, None
+        elif {"TC", "TCb", "TCr"} & set(name.split("_")):
+            tc_path, tr_path = tr_path, None
+        elif {"RV", "RVc", "RVg", "RA"} & set(name.split("_")):
+            rv_path, tr_path = tr_path, None
     flags = set(name.split("_"))
     cfg = TreeConfig(probability_table="gt", keep_gates=False, decision="tree", monitor=True)
     floor = next((int(f[1:]) / 100.0 for f in flags if f.startswith("f") and f[1:].isdigit()), None)
     factor = next((float(f[1:]) for f in flags if f.startswith("m") and f[1:].isdigit()), None)
     horizon = next((int(f[1:]) for f in flags if f.startswith("h") and f[1:].isdigit()), None)
+    mon_h = next((int(f[2:]) for f in flags if f.startswith("Mh") and f[2:].isdigit()), None)
     decay = next((int(f[2:]) / 10.0 for f in flags if f.startswith("ad") and f[2:].isdigit()), None)
     relax = next((int(f[2:]) / 10.0 for f in flags if f.startswith("rf") and f[2:].isdigit()), None)
     sig_cap = next((int(f[2:]) / 10.0 for f in flags if f.startswith("sg") and f[2:].isdigit()), None)
@@ -338,7 +452,7 @@ def make_reactive_planner(name):
         cfg.monitor_tree = False
 
     def factory(P, track):
-        if horizon is not None or relax is not None:
+        if horizon is not None or relax is not None or mon_h is not None:
             P = copy.copy(P)
             if horizon is not None:
                 P.horizon_steps = horizon
@@ -360,9 +474,25 @@ def make_reactive_planner(name):
         tp = ReactiveTreePlanner(P, track, cfg=TreeConfig(**cfg.__dict__), rp=rp, single="single" in flags,
                                  drop_common="common" not in flags)
         tp.name = name
+        tp.mon_horizon = mon_h
         if tr_path:
             from .rl.tail_risk import load_tail_fn
             tp.tail_fn = load_tail_fn(tr_path)
+        if rv_path:
+            from .rl.risk_value import load_rv_fn
+            paths = rv_path.split("+")                 # '_RV_RA@<RV>+<RA>', '_RA@<RA>'
+            if {"RV", "RVc", "RVg"} & flags:
+                tp.rv_fn = load_rv_fn(paths.pop(0))
+            if "RA" in flags:
+                tp.ra_fn = load_rv_fn(paths.pop(0))
+            tp.rv_cost_only = "RVc" in flags
+            tp.rv_constraint_only = "RVg" in flags
+            tp.rv_monitor = "RVm" in flags
+        if tc_path:
+            from .rl.terminal_cost import load_tc_fn
+            tp.tc_fn = load_tc_fn(tc_path)
+            tp.tc_binary = bool({"TCb", "TCr"} & flags)
+            tp.tc_observe = "TCr" in flags
         if rc_path:
             from .rl.risk_critic import load_rc_fn
             tp.rc_fn, tp.rc_th = load_rc_fn(rc_path), rc_th
@@ -371,5 +501,9 @@ def make_reactive_planner(name):
         tp.nudge_go = probe is not None
         tp.nudge_max_speed = nudge_vmax
         tp.nudge_monitor = nudge_mon
+        if "G5" in flags:
+            # 분해 실험: 같은 플래너의 5 s 지평선판이 같은 틱에 지금 바꾸기를 고를 때만 지금 바꾼다(학습 없음, 비교 기준용)
+            g = "_".join(f for f in name.split("_") if f not in ("G5", "TC", "TCb", "TCr")).replace("_h10_", "_h25_")
+            tp.gate = make_reactive_planner(g)(P, track)
         return tp
     return factory

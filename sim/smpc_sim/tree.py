@@ -27,7 +27,7 @@ from .rollouts import (ACCEL, CHANGE_NOW, HOLD, KEEP, NUDGE, YIELD, ActionSpec, 
 
 CONTINUE, CONT_ACCEL, RETURN, RETURN_DECEL, BRAKE = range(5)
 RESPONSE_NAMES = ["continue", "continue+accel", "return", "return+decel", "brake"]
-# RC 대체 정지(rcf): ACC 차선 끝 대기 감속 한계(acc.py)와 대기 정지 거리(acc_planner.yaml lane_end_merge_wait_stop_distance_m)
+# 준비 후보의 차선 끝 정지 검사(rcf, TC): ACC 차선 끝 대기 감속 한계(acc.py)와 대기 정지 거리(acc_planner.yaml lane_end_merge_wait_stop_distance_m)
 RC_FALLBACK_DECEL = 2.5
 RC_FALLBACK_HOLD_M = 25.0
 
@@ -256,6 +256,10 @@ class TreePlanner(BaselineSmpc):
             return BaselineSmpc.decide(self, now, t, v_e, mission, acc_target, acc_status)
         self.hist.update(t, now)
         self.scene.update(t, now, P)
+        d_gate = None
+        if getattr(self, "gate", None) is not None:      # 분해 실험(G5): 긴 지평선 플래너도 매 틱 같은 상태로 판단
+            self.gate.nudging = getattr(self, "nudging", False)
+            d_gate = self.gate.decide(now, t, v_e, mission, acc_target, acc_status)
         pre_cap = min(mission, acc_target) if acc_target is not None else mission
         D = waypoint_blend_duration(v_e) * P.ego_reference_preview_duration_scale
         modes_of = self.modes_of(v_e)
@@ -310,6 +314,9 @@ class TreePlanner(BaselineSmpc):
         if getattr(self, "nudge_depth", None) and v_e < self.nudge_max_speed and has_target:
             # 머리 넣고 기다리기: 목표 차선 경계를 depth m 넘은 곳까지만 들어가 멈추고, 다음 틱부터 다시 판단한다
             specs.append(ActionSpec(NUDGE, 0.0, 0.0, D, False, depth=self.nudge_depth, go=getattr(self, "nudge_go", False)))
+        tc = getattr(self, "tc_fn", None) is not None
+        if tc:
+            specs.append(ActionSpec(KEEP))      # TC: 기다리기도 루트로 두고 남은 J 로 바꾸기·준비와 비교한다
 
         keep_traj = build_trajectories(ctx, [ActionSpec(KEEP)], self.track, P)
         keep_valid = bool(keep_traj.valid[0])
@@ -331,6 +338,10 @@ class TreePlanner(BaselineSmpc):
         g8 = self.acc_stable(now, acc_status)
         request = BehaviorRequest(lane_pair=(t.current_lane_id, t.target_lane_id), stamp=now)
         selected, reason, change = "", "", False
+        i_sel, explored, forced = None, False, False
+        prev_greedy_change, self._prev_greedy_change = getattr(self, "_prev_greedy_change", False), False
+        prev_gate_dis, self._prev_gate_dis = getattr(self, "_prev_gate_dis", False), False
+        self._rec_wants, self._rec_gate_dis = False, False    # 기록용: 2 s 가 지금 바꾸려 했나 / 긴 지평선 판이 막았나
         if desire and g1 and specs:
             traj = self.root_trajectories(ctx, specs, t)
             root_cost = (P.lane_change_base_cost + target_gap_cost + P.behavior_delay_cost_weight *
@@ -344,6 +355,8 @@ class TreePlanner(BaselineSmpc):
                 gate_ok &= projected_gap_ttc_safe(t, traj, specs, R, passing, modes_of, self.lanes, self.hist, now, P)
             compat = (pre_cap + 0.10 >= v_e) or self.acc_ack(t, acc_status)
             gate_ok[1:] &= compat
+            if tc:
+                gate_ok[-1] = traj.valid[-1]    # 기다리기는 ACC 응답과 무관
             common = self.common_ok(g6, g7, g8)
             feas = np.zeros(len(specs), dtype=bool)
             cost = np.full(len(specs), np.inf)
@@ -351,10 +364,36 @@ class TreePlanner(BaselineSmpc):
             if common and gate_ok.any():
                 feas, cost, combo, peak, br = self.evaluate_tree(traj, specs, t, v_e, R, vehicles, root_cost,
                                                                  candidate_mask=gate_ok)
+                raw_peak = getattr(self, "_raw_risk", peak).copy()    # 꼬리 항 전 지평선 안 위험(위험 기록용)
             ok = feas & gate_ok & common
             if ok[0] and self.cfg.monitor and self.monitor_core(t, v_e, mission, connector=near_end) == "return":
                 # 같은 상태에서 실행 중 재계획이 곧바로 복귀를 고를 바꾸기는 승인하지 않는다
                 ok[0] = False
+            ok_h = ok.copy()
+            if tc and specs[-1].action == KEEP and (getattr(self, "tc_binary", False) or getattr(self, "tc_observe", False)):
+                ok_h[-1] = False                # TCb·TCr 에서 기다리기 루트는 비교용이라 선택 후보가 아니다
+            self._rec_wants = bool(ok[0]) and int(np.argmin(np.where(ok_h, cost, np.inf))) == 0
+            if d_gate is not None and ok[0] and not d_gate.change_left and now >= getattr(self, "_force_change_until", -1.0):
+                # G5: 긴 지평선 플래너가 지금 바꾸지 않으면 지금 바꾸지 않는다.
+                # 수집용(explore_decision_mode='change'): 2 s 가 지금 바꾸려는데 막히기 시작한 틱에 확률 eps 로(차선당 한 번)
+                # 막지 않고 바꾼다(확정까지 0.6 s 유지) → 같은 상태에서 바꾸기·거절이 무작위로 갈린다
+                eps_g = getattr(self, "explore_decision", 0.0) or 0.0
+                wants = self._rec_wants
+                self._prev_gate_dis = wants
+                if eps_g > 0.0 and getattr(self, "explore_decision_mode", "") in ("change", "both") \
+                        and getattr(self, "explore_lane_prob", None) is not None:
+                    if getattr(self, "_ex_lane", None) != t.current_lane_id:
+                        self._ex_lane = t.current_lane_id
+                        self._ex_on = self.explore_rng.random() < self.explore_lane_prob
+                    if wants and not prev_gate_dis and getattr(self, "_ex_on", False) \
+                            and not getattr(self, "_sup_busy", False) and self.explore_rng.random() < eps_g:
+                        self._force_change_until = now + 0.6
+                        self._ex_on, forced = False, True
+                        self.explore_decisions.append((now, now))
+                self._rec_gate_dis = wants
+                if not forced:
+                    ok[0] = False
+                    self.gate_declines = getattr(self, "gate_declines", 0) + 1
             self._rc_x, self._rc_q = None, None
             if ok[0] and (getattr(self, "rc_fn", None) is not None or getattr(self, "rc_log", None) is not None):
                 # RC(rl/risk_critic.py): 지평선 안 기회 제약을 통과한 '지금 바꾸기'가 그 뒤 나쁘게 끝날 확률(중단·충돌·근접)을
@@ -372,39 +411,95 @@ class TreePlanner(BaselineSmpc):
                         ok[0] = False
                         self.rc_vetoes = getattr(self, "rc_vetoes", 0) + 1
                         if getattr(self, "rc_fallback", False) and t.lane_change_required:
-                            # 준비 후보(hold/yield/accel@t_lc)는 t_lc 뒤에 바꾼다고 가정해 차선 끝 정지를 걸지 않는다. 그때도 RC 가
-                            # 막으면 서지 못하고 차선 끝을 지나친다. 그래서 RC 가 막은 틱에는 준비를 실행하고도 바꾸지 못했을 때
-                            # ACC 차선 끝 대기(감속 2.5 m/s², 끝 25 m 앞 정지)로 설 수 있는 준비 후보만 남긴다.
-                            dist = t.distance_to_lane_end
-                            for j, sp in enumerate(specs):
-                                if not ok[j] or sp.action not in (HOLD, YIELD, ACCEL):
-                                    continue
-                                t_sw = execution_start(sp, P)
-                                v1 = max(0.0, v_e + sp.prep_accel * t_sw)
-                                s1 = 0.5 * (v_e + v1) * t_sw
-                                if v1 * v1 > 2.0 * RC_FALLBACK_DECEL * max(0.0, dist - s1 - RC_FALLBACK_HOLD_M):
-                                    ok[j] = False
+                            self._keep_stoppable_preps(ok, specs, v_e, t.distance_to_lane_end)
+            if tc and getattr(self, "tc_binary", False):
+                # TCb: 지금 바꾸기의 기대 남은 J 가 기다리기보다 크면 지금 바꾸지 않는다(둘 다 기회 제약을 지킬 때). 문턱 없음.
+                # 기다리기는 비교에만 쓰고, 바꾸지 않을 때 할 일은 기존 SMPC 비용으로 준비 후보 중에서 고른다.
+                tv = getattr(self, "_tc_root", None)
+                if ok[0] and ok[-1] and tv is not None and tv[0] > tv[-1] and not getattr(self, "tc_observe", False):
+                    ok[0] = False
+                    self.tc_declines = getattr(self, "tc_declines", 0) + 1
+                    if t.lane_change_required:
+                        self._keep_stoppable_preps(ok, specs, v_e, t.distance_to_lane_end)
+                ok[-1] = False
+            elif tc and t.lane_change_required:
+                # TC: 지금 바꾸기를 문턱으로 막지 않고 비용으로 미룰 수 있으므로, 준비 후보는 항상 차선 끝 전에 설 수 있는 것만
+                self._keep_stoppable_preps(ok, specs, v_e, t.distance_to_lane_end)
             wait_wins = False
             eps_w = getattr(self, "explore_wait_eps", 0.0)
-            if eps_w > 0.0 and ok.any() and keep_valid:
+            lane_ex = getattr(self, "explore_lane_prob", None) is not None
+            eps_d = getattr(self, "explore_decision", 0.0) or 0.0
+            if lane_ex and (eps_w > 0.0 or eps_d > 0.0 or getattr(self, "explore_eps", 0.0) > 0.0) \
+                    and getattr(self, "_ex_lane", None) != t.current_lane_id:
+                self._ex_lane = t.current_lane_id           # 탐색 시작: 이 차선에서 탐색할지 한 번 정한다
+                self._ex_on = self.explore_rng.random() < self.explore_lane_prob
+            ymode = getattr(self, "explore_decision_mode", "wait") == "yield"
+            if ymode and now < getattr(self, "_explore_wait_until", -1.0):
+                wait_wins = True                            # 결정 탐색(양보): 정한 시간 동안 감속 양보를 이어 간다
+                selected, reason = "yield(explore)", "explore_decision"
+            elif (eps_w > 0.0 or eps_d > 0.0 or getattr(self, "crn_wait", None) is not None) and ok.any() and keep_valid:
                 # 수집용 기다리기 탐색: 바꿀 수 있어도 0.5–3 s 일부러 기다린다(기다림의 결과를 데이터에 넣는다)
                 if now < getattr(self, "_explore_wait_until", -1.0):
                     wait_wins = True
-                elif self.explore_rng.random() < eps_w:
+                elif eps_w <= 0.0:
+                    pass
+                elif (not lane_ex or getattr(self, "_ex_on", False)) and self.explore_rng.random() < eps_w:
                     self._explore_wait_until = now + float(self.explore_rng.uniform(0.5, 3.0))
                     wait_wins = True
+                    if lane_ex:
+                        self._ex_on = False
+                        self.explore_events.append((now, self._explore_wait_until))
                 if wait_wins:
                     selected, reason = "wait(explore)", "explore_wait"
             if ok.any() and not wait_wins:
                 i = int(np.argmin(np.where(ok, cost, np.inf)))
+                i_sel = i
+                self._prev_greedy_change = specs[i].action == CHANGE_NOW
+                if self._prev_greedy_change and not prev_greedy_change and keep_valid and not getattr(self, "_sup_busy", False):
+                    # 결정 시작(탐욕 정책이 지금 바꾸기를 고르기 시작한 틱). 짝 비교는 같은 시드를 다시 돌려 이 틱부터 D 초 기다린다
+                    if hasattr(self, "decision_starts"):
+                        self.decision_starts.append(now)
+                    cw = getattr(self, "crn_wait", None)
+                    if cw is not None and abs(now - cw[0]) < 1e-6:
+                        self._explore_wait_until = now + cw[1]
+                        wait_wins, i_sel, forced = True, None, True
+                        selected, reason = "wait(explore)", "explore_decision"
+                if eps_d > 0.0 and lane_ex and getattr(self, "_ex_on", False) and self._prev_greedy_change \
+                        and getattr(self, "explore_decision_mode", "wait") != "change" \
+                        and not getattr(self, "_sup_busy", False) \
+                        and not prev_greedy_change and keep_valid and self.explore_rng.random() < eps_d:
+                    # 결정 탐색: 탐욕 정책이 지금 바꾸기를 고르기 시작한 틱마다 확률 eps_d 로 0.5–3 s 일부러 기다린다
+                    # (그 차선에서 한 번). 같은 상태에서 바꾸기·기다리기가 무작위로 갈려 기다리기의 이득을 편향 없이 잰다
+                    if ymode:       # 양보: 1–2.5 s 동안 감속 후보 중 하나로 감속(준비 후보 YIELD 와 같은 상한 식)
+                        d_y = float(self.explore_rng.uniform(1.0, 2.5))
+                        a_y = float(self.explore_rng.choice(P.behavior_yield_decel_candidates_mps2))
+                        floor = max(0.0, v_e - P.behavior_yield_max_speed_drop_mps)
+                        self._ex_yield = (a_y, max(min(floor, v_e), v_e + a_y * d_y))
+                        self._explore_wait_until = now + d_y
+                    else:
+                        self._explore_wait_until = now + float(self.explore_rng.uniform(0.5, 3.0))
+                    self._ex_on = False
+                    self.explore_decisions.append((now, self._explore_wait_until))   # 앞 표본을 clean 에서 빼지 않는다
+                    wait_wins, i_sel, forced = True, None, True
+                    selected, reason = ("yield(explore)" if ymode else "wait(explore)"), "explore_decision"
+            if ok.any() and not wait_wins:
                 eps = getattr(self, "explore_eps", 0.0)
-                if eps > 0.0 and ok.sum() >= 2 and self.explore_rng.random() < eps:
+                if eps > 0.0 and ok.sum() >= 2 and (not lane_ex or getattr(self, "_ex_on", False)) \
+                        and self.explore_rng.random() < eps:
                     i = int(self.explore_rng.choice(np.nonzero(ok)[0]))     # 수집용 탐색(실행 가능한 후보 안에서만)
+                    i_sel, explored = i, True
+                    if lane_ex:
+                        self._ex_on = False
+                        self.explore_events.append((now, now))
                 spec = specs[i]
                 selected = spec.label + " " + ",".join(RESPONSE_NAMES[r] for r in combo[i][1:])
                 if spec.action == CHANGE_NOW:
                     change = True
                     self.lc_connector = near_end      # 실행 방식: 실행 중 모니터가 같은 방식으로 본다
+                    if getattr(self, "risk_log", None) is not None:
+                        self.risk_log.append((now, float(raw_peak[i]), "chg"))   # 지금 바꾸기를 고른 틱의 지평선 안 위험
+                elif spec.action == KEEP:
+                    self.tc_keeps = getattr(self, "tc_keeps", 0) + 1     # 요청 없음 → 아래에서 기다리기 요청
                 elif spec.action == NUDGE:
                     request = BehaviorRequest(action="nudge", active=True, speed_cap=pre_cap, accel=spec.depth,
                                               lane_pair=(t.current_lane_id, t.target_lane_id), stamp=now)
@@ -422,6 +517,12 @@ class TreePlanner(BaselineSmpc):
             elif not wait_wins:
                 reason = ("traj" if not traj.valid.any() else "scene/acc" if not common else
                           "gate" if not gate_ok.any() else "tree_risk")
+        if reason == "explore_decision" and selected.startswith("yield") and not change:
+            a_y, cap_y = self._ex_yield
+            request = BehaviorRequest(action="yield", active=True, speed_cap=cap_y, accel=a_y,
+                                      lane_pair=(t.current_lane_id, t.target_lane_id), stamp=now)
+        if getattr(self, "tc_record", False):
+            self._record_tc(now, t, specs if desire and g1 else [], i_sel, explored, forced)
         if desire and not change and not request.active:
             request = BehaviorRequest(action="wait", active=True, speed_cap=pre_cap,
                                       lane_pair=(t.current_lane_id, t.target_lane_id), stamp=now)
@@ -434,6 +535,44 @@ class TreePlanner(BaselineSmpc):
             self.rc_log.append((now, self._rc_x.tolist(), self._rc_q))     # RC 수집: 바꾸기를 시작한 순간의 특징
         return Decision(change_left=change, request=request, desire=desire, feasible=change,
                         reason=reason, selected=selected)
+
+    def _record_tc(self, now, t, specs, i_sel, explored, forced=False):
+        """TC 수집: 이번 틱에 실제로 따른 루트의 잎(가지마다 고른 대응의 잎 특징·확률·대응 비용)을 남긴다.
+        후보를 고르지 않은 틱(기다리기)은 기다리기 루트. 차선 변경이 확정·실행 중인 틱은 판단이 결과를 바꾸지 않으므로 뺀다."""
+        rows, tv = getattr(self, "_leaf_rows", None), getattr(self, "_tc_root", None)
+        self._leaf_rows, self._tc_root = None, None
+        if rows is None or tv is None or getattr(self, "_sup_busy", False) or not specs:
+            return
+        if i_sel is None and specs[-1].action == KEEP:
+            i_sel = len(specs) - 1
+        if i_sel is None or i_sel not in rows or i_sel not in self._tc_combo:
+            return
+        def leaf(j):
+            if j not in rows or j not in self._tc_combo:
+                return None
+            F, term, t_arr, tau = rows[j]
+            q = self._tc_combo[j]
+            b = np.arange(len(q))
+            return {"c": np.where(q == 1, 2.0, 0.0), "F": F[b, q], "term": term[b, q], "t_arr": t_arr[b, q], "tau": tau}
+        rec = {"t": now, "lane": int(t.current_lane_id), "action": specs[i_sel].action, "explored": explored, "forced": forced,
+               "p": self._tc_p, "Qc": float(tv[0]), "Qk": float(tv[-1]), "Qsel": float(tv[i_sel]),
+               "wants": getattr(self, "_rec_wants", False), "gate_dis": getattr(self, "_rec_gate_dis", False)}
+        rec.update(leaf(i_sel))
+        rec["chg"], rec["keep"] = leaf(0), leaf(len(specs) - 1) if specs[-1].action == KEEP else None   # TCb 비교용 두 루트
+        self.tc_records.append(rec)
+
+    def _keep_stoppable_preps(self, ok, specs, v_e, dist):
+        """준비 후보(hold/yield/accel@t_lc)는 t_lc 뒤에 바꾼다고 가정해 차선 끝 정지를 걸지 않는다. 지금 바꾸기가 계속 미뤄지면
+        서지 못하고 차선 끝을 지나칠 수 있으므로, 준비를 실행하고도 바꾸지 못했을 때 ACC 차선 끝 대기(감속 2.5 m/s²,
+        끝 25 m 앞 정지)로 설 수 있는 준비 후보만 남긴다."""
+        for j, sp in enumerate(specs):
+            if not ok[j] or sp.action not in (HOLD, YIELD, ACCEL):
+                continue
+            t_sw = execution_start(sp, self.P)
+            v1 = max(0.0, v_e + sp.prep_accel * t_sw)
+            s1 = 0.5 * (v_e + v1) * t_sw
+            if v1 * v1 > 2.0 * RC_FALLBACK_DECEL * max(0.0, dist - s1 - RC_FALLBACK_HOLD_M):
+                ok[j] = False
 
     # ------------------------------------------------- 하위 클래스 훅
     def root_trajectories(self, ctx, specs, t):

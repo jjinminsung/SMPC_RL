@@ -47,8 +47,18 @@ class EpisodeConfig:
     acc_floor_real: bool = False      # ACC 하한(merge_keep_rolling)을 실제 C++ 규칙대로(acc.py floor_real)
     acc_tf_on_start: bool = False     # ACC 가 차선 변경 실행 시작부터 목표 차선 앞차를 정상 추종(acc.py tf_on_start)
     record_risk: bool = False         # 0.5 s 구간별 최소 TTC·간격을 남긴다(risk_buckets, RC 라벨용)
+    record_states: bool = False       # 0.5 s 마다 (시각, 상태 특징 features2) 를 남긴다(samples, TC 학습용)
     explore_eps: float = 0.0          # 수집용 탐색: 판단 틱마다 이 확률로 실행 가능한 후보 중 하나를 무작위로 고른다
     explore_wait_eps: float = 0.0     # 수집용 탐색: 바꿀 수 있는 판단에서 이 확률로 0.5–3 s 일부러 기다린다
+    # 탐색 시작(exploring starts): 차선마다 이 확률로만 탐색하고, 탐색은 그 차선에서 한 번(위 두 확률은 틱당 발생률).
+    # 탐색 구간을 남겨 그 뒤 표본만 탐욕 정책의 값으로 쓴다. None = 틱마다 탐색(기존)
+    explore_lane_prob: float = None
+    explore_decision: float = 0.0     # 탐색 시작과 함께: 탐색할 차선에서 탐욕 정책이 지금 바꾸기를 고른 틱에 이 확률로 0.5–3 s 기다린다
+    explore_decision_mode: str = "wait"   # 'yield' = 기다리는 대신 1–2.5 s 감속 양보
+    tc_record: bool = False           # TC 수집: 판단 틱마다 실제로 따른 루트의 잎 기록(planner.tc_records)
+    crn_wait: tuple = None            # 짝 비교(같은 시드 재실행): (t_d, D) = 시각 t_d 의 결정 시작에서 D 초 기다리기를 강제
+    leaf_log: bool = False            # 지금 바꾸기를 명령한 틱마다 루트 0 의 지평선 끝 잎 특징(가지별)을 남긴다(RV·RA 잎 학습용)
+    risk_log: bool = False            # 위험 기록: 실제 주행 중 플래너가 계산한 지평선 안 위험(바꾸기 고른 틱, 실행 중 모니터, 머리 넣기)
 
 
 @dataclass
@@ -73,6 +83,7 @@ class EpisodeResult:
     min_sep: float = math.inf        # 2-D 박스 분리 최소값 max(종 간격, 횡 간격) (음수 = 겹침)
     near_lat_ticks: int = 0          # 나란히(종 겹침) 횡 간격 < 0.5 m 인 틱 수
     risk_buckets: list = field(default_factory=list)  # record_risk: [(구간 시작 t, 최소 TTC, 최소 간격)] 0.5 s 구간
+    samples: list = field(default_factory=list)       # record_states: [(t, 상태 특징)]
     nudges: int = 0                  # 머리 넣기 시작 횟수
     nudge_aborts: int = 0            # 머리 넣었다가 뺀 횟수(차선 변경으로 이어지지 않음)
 
@@ -288,6 +299,17 @@ class World:
         self.planner.explore_eps = cfg.explore_eps
         self.planner.explore_wait_eps = cfg.explore_wait_eps
         self.planner.explore_rng = np.random.default_rng(cfg.seed + 99991)
+        self.planner.explore_lane_prob = cfg.explore_lane_prob
+        self.planner.explore_decision = cfg.explore_decision
+        self.planner.explore_decision_mode = cfg.explore_decision_mode
+        self.planner.explore_events = []
+        self.planner.explore_decisions = []
+        self.planner.tc_record = cfg.tc_record
+        self.planner.tc_records = []
+        self.planner.crn_wait = cfg.crn_wait
+        self.planner.decision_starts = []
+        self.planner.risk_log = [] if cfg.risk_log else None
+        self.planner.leaf_log = [] if cfg.leaf_log else None
 
     def run(self):
         cfg = self.cfg
@@ -306,12 +328,19 @@ class World:
             self.step_npcs(cfg.dt)
             visible = self.npcs if cfg.perception == "gt" else self.lidar_like_view(e)
             t = build_targets(now, e, visible, self.track, self.P_sel, forced_pair=self.sup.forced_pair)
+            if cfg.record_states and (now - self.t0) + 1e-9 >= len(res.samples) * 0.5:
+                from .rl.features2 import state_features2
+                res.samples.append((round(now - self.t0, 2), state_features2(t, e).tolist()))
             nudge_mon = getattr(self.planner, "nudge_monitor", False)
             self.planner.nudging = nudging and nudge_mon
             mon_n = (self.planner.nudge_monitor_tick(now, t, e.v, cfg.mission_speed)
                      if nudging and nudge_mon and not self.sup.active else None)
             mon_ret = mon_ret + 1 if mon_n == "return" else 0
+            self.planner._sup_busy = self.sup.active or self.sup.pending_at is not None
+            self.planner._leaf0 = None
             dec = self.planner.decide(now, t, e.v, cfg.mission_speed, self.acc.f, self.acc.status)
+            if cfg.leaf_log and dec.change_left and not self.planner._sup_busy and self.planner._leaf0 is not None:
+                self.planner.leaf_log.append((now,) + self.planner._leaf0)
             if dec.change_left:
                 last_change_left = now
                 self.acc.last_change_left = now

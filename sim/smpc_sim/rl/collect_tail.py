@@ -22,7 +22,8 @@ def one(args):
     from smpc_sim.rollouts import execution_start
     from smpc_sim.rl.tail_risk import leaf_inputs
     from smpc_sim.world import World, EpisodeConfig
-    w = World(planner_factory(planner), EpisodeConfig(seed=seed, **CFG))
+    tfs = "tfs" in planner.split("@")[0].split("_")          # 예측 ACC 규칙(tfs)과 시뮬 ACC 를 같이 바꾼다
+    w = World(planner_factory(planner), EpisodeConfig(seed=seed, acc_tf_on_start=tfs, **CFG))
     p = w.planner
     X, Y, A, M, n = [], [], [], [], [0, 0]
     orig = p._solve
