@@ -193,7 +193,9 @@ class ReactiveTreePlanner(TreePlanner):
                 if good.any():
                     kt = int(np.argmin(np.where(good, tc_total, np.inf)))
                     self._tc_root[i], self._tc_combo[i] = tc_total[kt], combos[kt]
-                if not getattr(self, "tc_binary", False):  # 전체 모드: 모든 루트를 TC 값으로 고른다(휴리스틱 루트 비용 없음)
+                if getattr(self, "tc_add", False):         # VT: 휴리스틱 루트 비용 + 지평선 뒤 남은 시간(모든 루트에 같은 함수)
+                    total = total + tc_total
+                elif not getattr(self, "tc_binary", False):  # 전체 모드: 모든 루트를 TC 값으로 고른다(휴리스틱 루트 비용 없음)
                     total = tc_total
             if good.any():
                 k = int(np.argmin(np.where(good, total, np.inf)))
@@ -415,17 +417,27 @@ def make_reactive_planner(name):
       '_MhNN' = 실행 중 모니터(차선 변경·머리 넣기)만 지평선 NN 스텝, 판단은 hNN 그대로.
     RL 위험 값: '_RV@<RV 가중치>' = 판단의 기회 제약·비용에 지평선 뒤 최대 위험 Σ_b p_b V_b(rl/risk_value.py),
       '_RA@<RA 가중치>' = 루트 비용에 Σ_b p_b · 30 · A(잎_b)(지평선 뒤 중단 기댓값, 30 = 기존 복귀 대응 비용),
-      둘 다: '_RV_RA@<RV>+<RA>'. '_RVc@' = 비용에만, '_RVg@' = 기회 제약에만(잎 학습판은 루트 0 에만 붙어 비용에 넣으면 기다리기 쪽으로 기운다), 'RVm' 을 더하면 실행 중 모니터의 계속·복귀 위험에도 같은 값을 쓴다(문턱은 기존 2ε)."""
+      둘 다: '_RV_RA@<RV>+<RA>'. '_RVc@' = 비용에만, '_RVg@' = 기회 제약에만(잎 학습판은 루트 0 에만 붙어 비용에 넣으면 기다리기 쪽으로 기운다), 'RVm' 을 더하면 실행 중 모니터의 계속·복귀 위험에도 같은 값을 쓴다(문턱은 기존 2ε).
+    남은 시간 값: '_VT@<V_T 가중치>' = 휴리스틱 루트 비용에 Σ_b p_b [대응 비용 + τ + V_T(잎)] 를 모든 루트에 같은 함수로 더한다
+      (V_T = 잎에서 이 차선 변경을 마칠 때까지의 J [s], rl/terminal_cost.py). 기다리기 루트는 기록용(선택 후보 아님),
+      준비 후보는 차선 끝 전에 설 수 있는 것만. '_VTr@' = 휴리스틱의 지연 항(1.0·t_lc)을 빼고 V_T 가 대신한다.
+      '_VTp@' = 준비 후보(t_lc 0.4–2.0 s)를 지평선 맞춤 없이 모두 둔다(실행 시작이 지평선 뒤면 지평선 안은 원 차선 준비, 잎을 V_T 가 평가).
+      위험 값과 함께: '_RVg_VT@<RV>+<V_T>' (마지막 경로가 V_T). 수집: '_RVg_TCr@<RV>+<V_T>' = 판단은 RVg 그대로, 잎만 기록."""
     from .tree import TreeConfig
     tr_path, rc_path, rc_th, tc_path, rv_path = None, None, None, None, None
     if "@" in name:
         name, tr_path = name.split("@", 1)
+        nf = set(name.split("_"))
         rc_th = next((int(f[2:]) / 100.0 for f in name.split("_") if f.startswith("RC") and f[2:].isdigit()), None)
         if rc_th is not None:
             rc_path, tr_path = tr_path, None
-        elif {"TC", "TCb", "TCr"} & set(name.split("_")):
-            tc_path, tr_path = tr_path, None
-        elif {"RV", "RVc", "RVg", "RA"} & set(name.split("_")):
+        elif {"TC", "TCb", "TCr", "VT", "VTr", "VTp"} & nf:
+            if {"RV", "RVc", "RVg", "RA"} & nf:
+                rv_path, tc_path = tr_path.rsplit("+", 1)
+            else:
+                tc_path = tr_path
+            tr_path = None
+        elif {"RV", "RVc", "RVg", "RA"} & nf:
             rv_path, tr_path = tr_path, None
     flags = set(name.split("_"))
     cfg = TreeConfig(probability_table="gt", keep_gates=False, decision="tree", monitor=True)
@@ -452,8 +464,9 @@ def make_reactive_planner(name):
         cfg.monitor_tree = False
 
     def factory(P, track):
-        if horizon is not None or relax is not None or mon_h is not None:
+        if horizon is not None or relax is not None or mon_h is not None or "VTp" in flags:
             P = copy.copy(P)
+            P.prep_beyond_horizon = "VTp" in flags
             if horizon is not None:
                 P.horizon_steps = horizon
             if relax is not None:
@@ -493,6 +506,9 @@ def make_reactive_planner(name):
             tp.tc_fn = load_tc_fn(tc_path)
             tp.tc_binary = bool({"TCb", "TCr"} & flags)
             tp.tc_observe = "TCr" in flags
+            tp.tc_add = bool({"VT", "VTr", "VTp"} & flags)
+            tp.tc_nodelay = "VTr" in flags
+            tp.prep_beyond = "VTp" in flags
         if rc_path:
             from .rl.risk_critic import load_rc_fn
             tp.rc_fn, tp.rc_th = load_rc_fn(rc_path), rc_th

@@ -88,7 +88,7 @@ def main():
     ap.add_argument("--state_w", type=float, default=1.0, help="--roots 일 때 실제 상태 MSE 무게(0 = 루트 값만으로 학습)")
     ap.add_argument("--notchange_keep", action="store_true", help="--roots: 바꾸지 않은 틱은 기다리기 루트 잎으로 맞춘다(TCb 비교용)")
     a = ap.parse_args()
-    paths = sorted({p for d in a.data for p in glob.glob(d) if not p.endswith("_roots.npz")})
+    paths = sorted({p for d in a.data for p in glob.glob(d) if not p.endswith(("_roots.npz", "_leaf.npz"))})
     X, G, E, T = load(paths)
     if a.target == "lane":
         eps = {e["seed"]: e for p in paths for e in json.load(open(p[:-4] + ".json"))["episodes"]}

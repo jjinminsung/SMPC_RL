@@ -310,7 +310,8 @@ class TreePlanner(BaselineSmpc):
                 specs.append(ActionSpec(YIELD, a, t_lc, D, True))
             if accel_ok:
                 specs.append(ActionSpec(ACCEL, a_r, t_lc, D, True))
-        specs = [s for s in specs if fits_horizon(s, P)]
+        # VTp: 준비 후보는 지평선 맞춤 없이 모두(잎 = 실행 시작 전 상태를 남은 시간 값이 평가). 차선 변경 자체는 나중 틱의 지금 바꾸기로만 한다
+        specs = [s for s in specs if fits_horizon(s, P) or (getattr(self, "prep_beyond", False) and s.action != CHANGE_NOW)]
         if getattr(self, "nudge_depth", None) and v_e < self.nudge_max_speed and has_target:
             # 머리 넣고 기다리기: 목표 차선 경계를 depth m 넘은 곳까지만 들어가 멈추고, 다음 틱부터 다시 판단한다
             specs.append(ActionSpec(NUDGE, 0.0, 0.0, D, False, depth=self.nudge_depth, go=getattr(self, "nudge_go", False)))
@@ -344,7 +345,8 @@ class TreePlanner(BaselineSmpc):
         self._rec_wants, self._rec_gate_dis = False, False    # 기록용: 2 s 가 지금 바꾸려 했나 / 긴 지평선 판이 막았나
         if desire and g1 and specs:
             traj = self.root_trajectories(ctx, specs, t)
-            root_cost = (P.lane_change_base_cost + target_gap_cost + P.behavior_delay_cost_weight *
+            w_delay = 0.0 if getattr(self, "tc_nodelay", False) else P.behavior_delay_cost_weight   # VTr: 지연은 V_T 가 맡는다
+            root_cost = (P.lane_change_base_cost + target_gap_cost + w_delay *
                          np.array([s.t_lc for s in specs]) + P.behavior_accel_cost_weight *
                          np.array([s.prep_accel for s in specs]) ** 2 +
                          np.array([getattr(self, "nudge_cost", 0.0) if s.action == NUDGE else 0.0 for s in specs]))
@@ -370,8 +372,9 @@ class TreePlanner(BaselineSmpc):
                 # 같은 상태에서 실행 중 재계획이 곧바로 복귀를 고를 바꾸기는 승인하지 않는다
                 ok[0] = False
             ok_h = ok.copy()
-            if tc and specs[-1].action == KEEP and (getattr(self, "tc_binary", False) or getattr(self, "tc_observe", False)):
-                ok_h[-1] = False                # TCb·TCr 에서 기다리기 루트는 비교용이라 선택 후보가 아니다
+            if tc and specs[-1].action == KEEP and (getattr(self, "tc_binary", False) or getattr(self, "tc_observe", False)
+                                                     or getattr(self, "tc_add", False)):
+                ok_h[-1] = False                # TCb·TCr·VT 에서 기다리기 루트는 비교·기록용이라 선택 후보가 아니다
             self._rec_wants = bool(ok[0]) and int(np.argmin(np.where(ok_h, cost, np.inf))) == 0
             if d_gate is not None and ok[0] and not d_gate.change_left and now >= getattr(self, "_force_change_until", -1.0):
                 # G5: 긴 지평선 플래너가 지금 바꾸지 않으면 지금 바꾸지 않는다.
@@ -425,6 +428,8 @@ class TreePlanner(BaselineSmpc):
             elif tc and t.lane_change_required:
                 # TC: 지금 바꾸기를 문턱으로 막지 않고 비용으로 미룰 수 있으므로, 준비 후보는 항상 차선 끝 전에 설 수 있는 것만
                 self._keep_stoppable_preps(ok, specs, v_e, t.distance_to_lane_end)
+            if tc and getattr(self, "tc_add", False) and specs[-1].action == KEEP:
+                ok[-1] = False                  # VT: 기다리기 루트는 선택 후보가 아니다(바꾸기·준비가 다 막히면 기존처럼 기다린다)
             wait_wins = False
             eps_w = getattr(self, "explore_wait_eps", 0.0)
             lane_ex = getattr(self, "explore_lane_prob", None) is not None

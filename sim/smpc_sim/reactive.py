@@ -551,7 +551,9 @@ def joint_rollout(ctx, specs, t, vehicles, P, A, RP, track, branches, accel_of, 
     chg = np.array([sp.change_left for sp in specs])
     valid = np.ones(N, dtype=bool)
     if not mid:
-        valid &= ~chg | ~np.isnan(tau_m[:N])
+        # VTp(남은 시간 값이 지평선 뒤를 평가): 실행 시작이 지평선 뒤인 준비 후보는 지평선 안에서 원 차선 준비만 하므로 유지처럼 본다
+        beyond = np.array([sp.change_left and sp.t_lc > 0.0 for sp in specs]) & bool(getattr(P, "prep_beyond_horizon", False))
+        valid &= ~chg | ~np.isnan(tau_m[:N]) | (beyond & (x0[:, -1] <= src_end + 1e-6))
         if connector:
             valid &= ~chg | (np.nan_to_num(ds_sw[:N], nan=0.0) <= P.stopped_launch_connector_max_preswitch_distance_m)
     if getattr(P, "fit_relax_after_start_s", None) is None:      # 완화 옵션이면 지평선 끝 완료 검사를 하지 않는다
